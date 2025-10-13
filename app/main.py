@@ -1,6 +1,7 @@
 from fastapi import FastAPI
+from app.core.events import lifespan
 
-app = FastAPI()
+app = FastAPI(title="self-hosted chatbot", lifespan=lifespan)
 
 
 @app.get("/test")
