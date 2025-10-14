@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     sender_email: str = Field(env="SENDER_EMAIL")
     sender_password: str = Field(env="SENDER_PASSWORD")
 
+    # OpenAI
+    openai_model: str = Field(env="OPENAI_MODEL")
+    model_temperature: int = Field(0, env="MODEL_TEMPERATURE")
+    openai_api_key: str = Field(env="OPENAI_API_KEY")
+
     class Config:
         env_file = ".env"
         extra = "ignore"

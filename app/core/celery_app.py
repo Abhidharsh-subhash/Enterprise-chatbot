@@ -5,7 +5,7 @@ celery_app = Celery(
     "chatbot",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.email"],
+    include=["app.tasks.email", "app.tasks.vector_tasks"],
 )
 
 celery_app.conf.update(
