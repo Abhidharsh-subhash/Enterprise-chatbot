@@ -4,7 +4,8 @@ from app.schemas.user import CreateUser, GetUser, GetUsers, LoginUser
 from app.dependencies import get_db
 from app.models.users import Users
 from sqlalchemy import select
-from app.utils.password import hash_password
+from app.utils.password import hash_password, verify_password
+from app.utils.tokens import create_access_token, create_refresh_token
 from app.tasks.email import send_email_task
 
 router = APIRouter(prefix="/user", tags=["User"])
@@ -50,5 +51,20 @@ async def signup(user: CreateUser, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login")
-async def login(db: AsyncSession = Depends(get_db)):
-    pass
+async def login(data: LoginUser, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Users).where(Users.email == data.email))
+    user = result.scalar_one_or_none()
+
+    if not user or not verify_password(data.password, user.password):
+        return {
+            "status_code": status.HTTP_404_NOT_FOUND,
+            "message": "Invalid email or password",
+        }
+    access_token = create_access_token({"sub": str(user.id), "email": user.email})
+    refresh_token = create_refresh_token({"sub": str(user.id)})
+    return {
+        "status_coce": status.HTTP_200_OK,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "message": "LoggedIn Successfully",
+    }
