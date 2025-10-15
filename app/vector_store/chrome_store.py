@@ -15,3 +15,22 @@ def get_collection():
 def add_to_vector_db(chunks, embeddings, metadatas, ids):
     col = get_collection()
     col.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
+
+
+def add_to_vector_db(chunks, embeddings, metadatas, ids):
+    col = get_collection()
+    col.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
+
+
+def query_user_vectors(query_embedding, user_id: str, top_k: int = 5):
+    """
+    Return top_k results for this user_id using the query embedding.
+    """
+    col = get_collection()
+    results = col.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        where={"user_id": str(user_id)},
+        include=["documents", "metadatas", "distances"],
+    )
+    return results
