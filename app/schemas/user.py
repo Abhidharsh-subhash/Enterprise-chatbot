@@ -15,3 +15,8 @@ class GetUser(BaseModel):
 
 class GetUsers(BaseModel):
     users: List[GetUser]
+
+
+class LoginUser(BaseModel):
+    email: EmailStr = Field(..., example="johndoe@example.com")
+    password: str = Field(..., min_length=6, example="securePassword123")

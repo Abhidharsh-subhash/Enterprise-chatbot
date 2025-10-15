@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.schemas.user import CreateUser, GetUser, GetUsers
+from app.schemas.user import CreateUser, GetUser, GetUsers, LoginUser
 from app.dependencies import get_db
 from app.models.users import Users
 from sqlalchemy import select
@@ -24,26 +24,31 @@ async def signup(user: CreateUser, db: AsyncSession = Depends(get_db)):
     db.add(new_user)
     await db.commit()
 
-    subject = "Testing - Signup Successful"
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>Welcome!</title>
-    </head>
-    <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
-        <div style="max-width: 600px; margin: auto; background-color: white; padding: 30px; border-radius: 10px; text-align: center;">
-            <h1 style="color: #4CAF50;">Welcome to the Team!</h1>
-            <p>Hi there,</p>
-            <p>We are thrilled to have you on board. Get ready for an exciting journey!</p>
-            <p>Best regards,<br>Your Company Name</p>
-        </div>
-    </body>
-    </html>
-    """
-    send_email_task.delay(user.email, subject, html_content)
+    # subject = "Testing - Signup Successful"
+    # html_content = """
+    # <!DOCTYPE html>
+    # <html>
+    # <head>
+    #     <meta charset="UTF-8">
+    #     <title>Welcome!</title>
+    # </head>
+    # <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+    #     <div style="max-width: 600px; margin: auto; background-color: white; padding: 30px; border-radius: 10px; text-align: center;">
+    #         <h1 style="color: #4CAF50;">Welcome to the Team!</h1>
+    #         <p>Hi there,</p>
+    #         <p>We are thrilled to have you on board. Get ready for an exciting journey!</p>
+    #         <p>Best regards,<br>Your Company Name</p>
+    #     </div>
+    # </body>
+    # </html>
+    # """
+    # send_email_task.delay(user.email, subject, html_content)
     return {
         "status_code": status.HTTP_201_CREATED,
         "message": "User registered successfully",
     }
+
+
+@router.post("/login")
+async def login(db: AsyncSession = Depends(get_db)):
+    pass
