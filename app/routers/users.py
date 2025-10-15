@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.user import CreateUser, GetUser, GetUsers, LoginUser
-from app.dependencies import get_db
+from app.dependencies import get_db, get_current_user
 from app.models.users import Users
 from sqlalchemy import select
 from app.utils.password import hash_password, verify_password
@@ -63,8 +63,18 @@ async def login(data: LoginUser, db: AsyncSession = Depends(get_db)):
     access_token = create_access_token({"sub": str(user.id), "email": user.email})
     refresh_token = create_refresh_token({"sub": str(user.id)})
     return {
-        "status_coce": status.HTTP_200_OK,
+        "status_code": status.HTTP_200_OK,
         "access_token": access_token,
         "refresh_token": refresh_token,
         "message": "LoggedIn Successfully",
+    }
+
+
+@router.get("/getuser")
+async def user_details(current_user: Users = Depends(get_current_user)):
+    return {
+        "status_code": status.HTTP_200_OK,
+        "id": current_user.id,
+        "user_name": current_user.username,
+        "email": current_user.email,
     }
