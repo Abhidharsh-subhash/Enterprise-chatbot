@@ -8,7 +8,7 @@ import uuid
 
 
 @celery_app.task
-def process_file_task(file_path: str):
+def process_file_task(file_path: str, user_id: str):
     """Background task for extracting, chunking, embedding and storing file."""
     try:
         file_name = os.path.basename(file_path)
@@ -29,6 +29,7 @@ def process_file_task(file_path: str):
                 "upload_time": now_iso,
                 "source_path": file_path,
                 "doc_id": doc_id,
+                "user_id": str(user_id),
             }
             for i in range(len(chunks))
         ]
