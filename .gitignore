@@ -2,6 +2,5 @@ __pycache__
 .venv
 .env
 versions
-vector_store
 uploads
 vector_db
