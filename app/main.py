@@ -11,12 +11,3 @@ app.include_router(api_router)
 async def root():
     return {"message": "Hello World"}
 
-
-@app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui_html(req: Request):
-    root_path = req.scope.get("root_path", "").rstrip("/")
-    openapi_url = root_path + app.openapi_url
-    return get_swagger_ui_html(
-        openapi_url=openapi_url,
-        title="API",
-    )
