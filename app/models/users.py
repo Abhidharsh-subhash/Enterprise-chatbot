@@ -1,5 +1,5 @@
 from app.db.postgres.database import Base
-from sqlalchemy.orm import mapped_column, Mapped
+from sqlalchemy.orm import mapped_column, Mapped, relationship
 from sqlalchemy import Integer, String, DateTime, func
 from datetime import datetime
 import uuid
@@ -26,6 +26,11 @@ class Users(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+    # ✅ Add this relationship
+    uploaded_files = relationship(
+        "UploadedFiles", back_populates="user", cascade="all, delete-orphan"
     )
 
     def __repr__(self):
