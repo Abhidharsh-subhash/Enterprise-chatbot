@@ -77,6 +77,8 @@ passlib==1.7.4
 posthog==5.4.0
 prompt_toolkit==3.0.52
 protobuf==6.32.1
+psycopg==3.2.12
+psycopg2-binary==2.9.11
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pybase64==1.4.2
