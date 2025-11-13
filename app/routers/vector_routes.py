@@ -1,5 +1,5 @@
 import os
-from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends, BackgroundTasks
 from app.tasks.vector_tasks import process_file_task
 from app.models.users import Users
 from app.dependencies import get_current_user
@@ -7,7 +7,8 @@ from app.schemas.vector import AskRequest
 from app.vector_store.chrome_store import query_user_vectors
 from app.utils.embeddings import get_embedding
 import openai
-from app.rag.reasoning import refine_query, rank_evidence, compose_answer
+from app.rag.reasoning import compose_answer
+from app.rag.memory import get_summary, get_history, messages_to_text, update_memory
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -151,18 +152,103 @@ async def upload_file(
 #         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
+# @router.post("/ask")
+# async def ask_question(
+#     payload: AskRequest, current_user: Users = Depends(get_current_user)
+# ):
+#     try:
+#         q = (payload.question or "").strip()
+#         if not q:
+#             raise HTTPException(status_code=400, detail="Question is required.")
+
+#         # 1) Embed raw question and fetch top-2
+#         q_emb = get_embedding(q)
+#         results = query_user_vectors(q_emb, str(current_user.id), top_k=2)
+
+#         docs = results.get("documents", [[]])[0]
+#         metas = results.get("metadatas", [[]])[0]
+#         distances = results.get("distances", [[]])[0]
+#         ids = results.get("ids", [[]])[0]
+
+#         if not docs:
+#             raise HTTPException(
+#                 status_code=404,
+#                 detail="No matching context found. Upload a file first.",
+#             )
+
+#         # 2) Build context blocks and sources
+#         context_parts = []
+#         sources = []
+#         for i, (doc, meta, dist, _id) in enumerate(
+#             zip(docs, metas, distances, ids), start=1
+#         ):
+#             sim = (1 - (dist or 0)) if dist is not None else None
+#             header = f"Source [{i}] | file: {meta.get('file_name')} | chunk: {meta.get('chunk_index')}"
+#             context_parts.append(f"{header}\n{doc}")
+#             sources.append(
+#                 {
+#                     "rank": i,
+#                     "id": _id,
+#                     "file_name": meta.get("file_name"),
+#                     "chunk_index": meta.get("chunk_index"),
+#                     "doc_id": meta.get("doc_id"),
+#                     "upload_time": meta.get("upload_time"),
+#                     "similarity": sim,
+#                 }
+#             )
+
+#         # Optional: cap context length if you kept max_context_chars in your schema
+#         max_chars = getattr(payload, "max_context_chars", None)
+#         if max_chars:
+#             used = 0
+#             trimmed = []
+#             for block in context_parts:
+#                 if used + len(block) > max_chars:
+#                     break
+#                 trimmed.append(block)
+#                 used += len(block)
+#             context_parts = trimmed
+
+#         answer, brief_explanation = compose_answer(
+#             payload.question, context_parts, temperature=payload.temperature
+#         )
+#         return {
+#             "status_code": status.HTTP_200_OK,
+#             "answer": answer,
+#             "brief_explanation": brief_explanation,
+#             "sources": sources,
+#             "query_used": q,
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
 @router.post("/ask")
 async def ask_question(
-    payload: AskRequest, current_user: Users = Depends(get_current_user)
+    payload: AskRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Users = Depends(get_current_user),
 ):
     try:
         q = (payload.question or "").strip()
         if not q:
             raise HTTPException(status_code=400, detail="Question is required.")
 
-        # 1) Embed raw question and fetch top-2
+        user_id = str(current_user.id)
+
+        # A) Load memory (summary + recent buffer)
+        conv_summary = get_summary(user_id, payload.session_id)
+        recent_text = ""
+        try:
+            recent_text = messages_to_text(get_history(user_id, payload.session_id).messages)
+        except Exception:
+            pass
+
+        # B) Embed + retrieve user-scoped docs (unchanged)
         q_emb = get_embedding(q)
-        results = query_user_vectors(q_emb, str(current_user.id), top_k=2)
+        results = query_user_vectors(q_emb, user_id, top_k=2)
 
         docs = results.get("documents", [[]])[0]
         metas = results.get("metadatas", [[]])[0]
@@ -175,12 +261,15 @@ async def ask_question(
                 detail="No matching context found. Upload a file first.",
             )
 
-        # 2) Build context blocks and sources
+        # C) Build context blocks (prepend summary and a tiny recent buffer)
         context_parts = []
+        if conv_summary.strip():
+            context_parts.append(f"Conversation summary:\n{conv_summary}")
+        if recent_text.strip():
+            context_parts.append(f"Recent chat excerpt:\n{recent_text}")
+
         sources = []
-        for i, (doc, meta, dist, _id) in enumerate(
-            zip(docs, metas, distances, ids), start=1
-        ):
+        for i, (doc, meta, dist, _id) in enumerate(zip(docs, metas, distances, ids), start=1):
             sim = (1 - (dist or 0)) if dist is not None else None
             header = f"Source [{i}] | file: {meta.get('file_name')} | chunk: {meta.get('chunk_index')}"
             context_parts.append(f"{header}\n{doc}")
@@ -196,11 +285,10 @@ async def ask_question(
                 }
             )
 
-        # Optional: cap context length if you kept max_context_chars in your schema
+        # D) Optional: cap prompt size
         max_chars = getattr(payload, "max_context_chars", None)
         if max_chars:
-            used = 0
-            trimmed = []
+            used, trimmed = 0, []
             for block in context_parts:
                 if used + len(block) > max_chars:
                     break
@@ -208,9 +296,14 @@ async def ask_question(
                 used += len(block)
             context_parts = trimmed
 
+        # E) Ask the model (your existing RAG composer)
         answer, brief_explanation = compose_answer(
             payload.question, context_parts, temperature=payload.temperature
         )
+
+        # F) Update memory asynchronously (summary + history)
+        background_tasks.add_task(update_memory, user_id, payload.session_id, q, answer)
+
         return {
             "status_code": status.HTTP_200_OK,
             "answer": answer,
