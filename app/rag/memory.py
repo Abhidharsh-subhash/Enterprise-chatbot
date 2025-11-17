@@ -7,8 +7,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 from app.core.config import settings
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-_r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+_r = redis.Redis.from_url(settings.memory_url, decode_responses=True)
 
 os.environ.setdefault("OPENAI_API_KEY", settings.openai_api_key)
 # Fast/cheap LLM for summary only
@@ -43,7 +42,7 @@ def set_summary(
 
 def get_history(user_id: str, session_id: Optional[str]) -> RedisChatMessageHistory:
     return RedisChatMessageHistory(
-        url=REDIS_URL,
+        url=settings.memory_url,
         session_id=f"{user_id}:{session_id or 'default'}",
         ttl=7 * 24 * 3600,
     )

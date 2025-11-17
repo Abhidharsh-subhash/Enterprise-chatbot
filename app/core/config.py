@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     model_temperature: int = Field(0, env="MODEL_TEMPERATURE")
     openai_api_key: str = Field(env="OPENAI_API_KEY")
 
+    # COT
+    memory_url: str = Field(env="MEMORY_URL")
+
     class Config:
         env_file = ".env"
         extra = "ignore"
