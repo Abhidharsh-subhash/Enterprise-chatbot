@@ -7,6 +7,7 @@ from fastapi import (
     status,
     Depends,
     BackgroundTasks,
+    Request,
 )
 from app.tasks.vector_tasks import process_file_task
 from app.models.users import Users
@@ -26,6 +27,7 @@ from app.rag.utils import (
 )
 from app.core.logger import logger
 import uuid
+from typing import Dict, Any
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -235,15 +237,13 @@ async def ask_question(
         )
 
         try:
-            answer, brief_explanation = (
-                compose_answer(
-                    original_question=q,
-                    context_blocks=context_parts,
-                    temperature=payload.temperature,
-                    must_answer=must_answer,
-                    include_example=include_example,
-                    max_sentences=2,
-                )
+            answer, brief_explanation = compose_answer(
+                original_question=q,
+                context_blocks=context_parts,
+                temperature=payload.temperature,
+                must_answer=must_answer,
+                include_example=include_example,
+                max_sentences=2,
             )
         except Exception as e:
             logger.error(f"compose_answer failed: {e}")
@@ -296,3 +296,47 @@ async def ask_question(
         raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/dummy_webhook", status_code=status.HTTP_200_OK)
+async def capture_details(
+    request: Request,  # Access to the raw request object
+) -> Dict[str, Any]:
+    """
+    Captures and prints the incoming request and dependency values,
+    then always returns a 200 OK success message.
+    """
+
+    ("\n--- 📥 CAPTURE ENDPOINT ACTIVATED ---")
+
+    # 2. Capture and Print Request Details (Headers, Query, Body)
+    print("\n▶️ Captured Request Details:")
+
+    # Headers
+    print(f"  Request Headers: {dict(request.headers)}")
+
+    # Query Parameters
+    query_params = dict(request.query_params)
+    print(f"  Query Parameters: {query_params}")
+
+    # Body (Asynchronously)
+    try:
+        body = await request.json()
+        logger.info(f"chatbot >> webhook >> Request Body >> {body}")
+    except Exception:
+        # Fallback for non-JSON content (e.g., plain text or empty)
+        body_bytes = await request.body()
+        if body_bytes:
+            logger.info(
+                f"chatbot >> webhook >> Request Body(Raw) >> {body_bytes.decode("utf-8", errors="ignore")}"
+            )
+        else:
+            logger.info(f"chatbot >> webhook >> Request Body >> Request Body: (Empty)")
+
+    print("--- ✅ CAPTURE COMPLETE ---")
+
+    # 3. Always return success and 200 OK (status_code is set in the decorator)
+    return {
+        "status_code": status.HTTP_200_OK,
+        "message": "Request successfull.",
+    }
