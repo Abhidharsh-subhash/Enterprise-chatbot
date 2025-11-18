@@ -17,6 +17,7 @@ from app.utils.embeddings import get_embedding
 from app.rag.reasoning import compose_answer, refine_query, rank_evidence
 from app.rag.memory import get_summary, get_history, messages_to_text, update_memory
 from app.rag.utils import evidence_is_strong, is_idk, extract_short_definition
+from app.core.logger import logger
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -352,7 +353,11 @@ async def ask_question(
             pass
 
         # B) Query rewrite + multi-query retrieval
-        r = refine_query(q)  # { rewrite, sub_questions[], keywords[] }
+        try:
+            r = refine_query(q)
+        except Exception as e:
+            logger.error(f"refine_query failed: {e}")
+            r = {"rewrite": q, "sub_questions": [], "keywords": []}
         search_queries = [q, r.get("rewrite")] + r.get("sub_questions", [])
         search_queries = [s for s in search_queries if s]
         # Dedup while preserving order; cap to 3 distinct queries
@@ -434,7 +439,13 @@ async def ask_question(
         candidates = list(candidates_map.values())
 
         # D) LLM rerank to find the best small set
-        ranked = rank_evidence(q, candidates)[:4]
+        try:
+            ranked = rank_evidence(q, candidates)[:4]
+        except Exception as e:
+            logger.error(f"rank_evidence failed: {e}")
+            ranked = sorted(
+                candidates, key=lambda c: c.get("similarity") or 0, reverse=True
+            )[:4]
 
         # E) Guard: if everything is weak, ask for clarification or return 404
         max_sim = max((c.get("similarity") or 0) for c in ranked) if ranked else 0.0
@@ -484,14 +495,19 @@ async def ask_question(
         must_answer = any(evidence_is_strong(c) for c in ranked)
 
         # H) Compose the answer using BOTH original and rewrite as hints
-        answer, brief_explanation = compose_answer(
-            original_question=q,
-            context_blocks=context_parts,
-            rewrite=r.get("rewrite"),
-            sub_questions=r.get("sub_questions", []),
-            temperature=payload.temperature,
-            must_answer=must_answer,
-        )
+        try:
+            answer, brief_explanation = compose_answer(
+                original_question=q,
+                context_blocks=context_parts,
+                rewrite=r.get("rewrite"),
+                sub_questions=r.get("sub_questions", []),
+                temperature=payload.temperature,
+                must_answer=must_answer,
+            )
+        except Exception as e:
+            logger.error(f"compose_answer failed: {e}")
+            answer = "I'm sorry, I encountered an issue generating the answer."
+            brief_explanation = "Fallback response"
 
         # I) Fallback: extract a short definition if model still says "I don't know" but evidence is strong
         fallback_used = False
