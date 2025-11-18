@@ -1,17 +1,20 @@
 import json
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from app.core.openai_client import client, CHAT_MODEL
 
 
 def refine_query(question: str) -> Dict:
     """
-    Step 1: Improve retrieval with a lightweight rewrite and sub-questions.
-    Returns JSON: { rewrite, sub_questions[], keywords[] }
+    Improve retrieval with a careful rewrite and (optional) sub-questions.
+    - Do NOT broaden the intent of the original question.
+    - If the original is a single word or very short, prefer a definitional rewrite:
+      e.g., "What is a <term> (in the likely domain of the provided context)?"
     """
     system = (
-        "You improve search queries for retrieval. "
-        "Return a JSON object with fields: rewrite (string), sub_questions (array of up to 3 strings), keywords (array). "
-        "Keep it concise."
+        "You improve search queries for retrieval without changing the user's intent. "
+        "If the question is a single word or very short and ambiguous, rewrite it into a definitional question, "
+        "keeping scope narrow and aligned with likely domain (e.g., programming if the context suggests it). "
+        "Return JSON: { rewrite (string), sub_questions (<=3), keywords (array) }."
     )
     user = f"Original question: {question}"
     resp = client.chat.completions.create(
@@ -83,28 +86,75 @@ def rank_evidence(question: str, candidates: List[Dict]) -> List[Dict]:
     return ordered
 
 
+# def compose_answer(
+#     question: str, context_blocks: List[str], temperature: float = 0.1
+# ) -> Tuple[str, str]:
+#     """
+#     Step 3: Compose final answer using only selected context.
+#     Returns (answer, brief_explanation). We do not expose full chain-of-thought.
+#     """
+#     system = (
+#         "Answer the user's question using ONLY the provided context. "
+#         "If unknown, reply exactly: I don't know. "
+#         "Do not include citations or source markers. No preamble. "
+#         "Respond as JSON with fields: answer (string), brief_explanation (<= 1 sentence)."
+#     )
+#     context = "\n\n---\n\n".join(context_blocks)
+#     user = json.dumps({"context": context, "question": question})
+#     resp = client.chat.completions.create(
+#         model=CHAT_MODEL,
+#         temperature=temperature,
+#         response_format={"type": "json_object"},
+#         messages=[
+#             {"role": "system", "content": system},
+#             {"role": "user", "content": user},
+#         ],
+#     )
+#     data = json.loads(resp.choices[0].message.content)
+#     answer = (data.get("answer") or "").strip()
+#     brief_explanation = (data.get("brief_explanation") or "").strip()
+#     return answer, brief_explanation
+
+
 def compose_answer(
-    question: str, context_blocks: List[str], temperature: float = 0.1
+    original_question: str,
+    context_blocks: List[str],
+    rewrite: Optional[str] = None,
+    sub_questions: Optional[List[str]] = None,
+    temperature: float = 0.1,
+    must_answer: bool = False,
 ) -> Tuple[str, str]:
     """
-    Step 3: Compose final answer using only selected context.
-    Returns (answer, brief_explanation). We do not expose full chain-of-thought.
+    Answer using ONLY the provided context.
+    - Prefer the original question for answering; use rewrite/sub_questions as hints.
+    - If must_answer is True and the context contains relevant evidence, do not return 'I don't know'.
+    Returns (answer, brief_explanation).
     """
     system = (
-        "Answer the user's question using ONLY the provided context. "
-        "If unknown, reply exactly: I don't know. "
+        "Answer the user's original question using ONLY the provided context. "
+        "Prefer the original_question; use rewrite/sub_questions only to disambiguate. "
+        "If the original question is ambiguous but the context clearly supports a likely interpretation, "
+        "infer that interpretation and answer accordingly. "
+        "If must_answer is true and the context contains relevant evidence, do NOT respond with 'I don't know'. "
+        "Only reply exactly 'I don't know.' if the context truly lacks enough information. "
         "Do not include citations or source markers. No preamble. "
-        "Respond as JSON with fields: answer (string), brief_explanation (<= 1 sentence)."
+        "Respond as JSON: { answer: string, brief_explanation: string }."
     )
     context = "\n\n---\n\n".join(context_blocks)
-    user = json.dumps({"context": context, "question": question})
+    payload = {
+        "context": context,
+        "original_question": original_question,
+        "rewrite": rewrite,
+        "sub_questions": sub_questions or [],
+        "must_answer": bool(must_answer),
+    }
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         temperature=temperature,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": json.dumps(payload)},
         ],
     )
     data = json.loads(resp.choices[0].message.content)

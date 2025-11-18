@@ -16,6 +16,7 @@ from app.vector_store.chrome_store import query_user_vectors, get_collection
 from app.utils.embeddings import get_embedding
 from app.rag.reasoning import compose_answer, refine_query, rank_evidence
 from app.rag.memory import get_summary, get_history, messages_to_text, update_memory
+from app.rag.utils import evidence_is_strong, is_idk, extract_short_definition
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -340,7 +341,7 @@ async def ask_question(
             raise HTTPException(status_code=400, detail="Question is required.")
         user_id = str(current_user.id)
 
-        # A) Load memory (same as before)
+        # A) Load memory (summary + recent buffer)
         conv_summary = get_summary(user_id, payload.session_id)
         recent_text = ""
         try:
@@ -352,10 +353,9 @@ async def ask_question(
 
         # B) Query rewrite + multi-query retrieval
         r = refine_query(q)  # { rewrite, sub_questions[], keywords[] }
-        print(f"value of r is {r}")
         search_queries = [q, r.get("rewrite")] + r.get("sub_questions", [])
         search_queries = [s for s in search_queries if s]
-        # Dedup while preserving order
+        # Dedup while preserving order; cap to 3 distinct queries
         seen = set()
         search_queries = [s for s in search_queries if not (s in seen or seen.add(s))][
             :3
@@ -371,8 +371,8 @@ async def ask_question(
             ids = res.get("ids", [[]])[0]
             for doc, meta, dist, _id in zip(docs, metas, dists, ids):
                 sim = (1 - (dist or 0)) if dist is not None else None
-                item = candidates_map.get(_id)
-                if not item:
+                existing = candidates_map.get(_id)
+                if not existing:
                     candidates_map[_id] = {
                         "id": _id,
                         "text": doc,
@@ -383,12 +383,12 @@ async def ask_question(
                         "similarity": sim,
                     }
                 else:
-                    # keep best similarity among duplicate hits from multi-query
                     if sim is not None:
-                        item["similarity"] = max(item.get("similarity") or 0, sim)
+                        existing["similarity"] = max(
+                            existing.get("similarity") or 0, sim
+                        )
 
-        # Larger top_k to give the reranker material
-        TOP_K = 3
+        TOP_K = 6  # give the reranker more candidates
         for sq in search_queries:
             emb = get_embedding(sq)
             res = query_user_vectors(emb, user_id, top_k=TOP_K)
@@ -400,8 +400,7 @@ async def ask_question(
                 detail="No matching context found. Upload a file first.",
             )
 
-        # C) Expand window around top hits (prev/next chunks)
-        # This helps when definitions span adjacent chunks.
+        # C) Expand neighbors around top hits (prev/next chunks)
         def expand_neighbor_ids(_id: str, window: int = 1):
             try:
                 base, idx = _id.rsplit(":", 1)
@@ -416,7 +415,6 @@ async def ask_question(
         for _id in list(candidates_map.keys()):
             neighbor_ids.update(expand_neighbor_ids(_id, window=1))
 
-        # Fetch neighbors we don't already have
         missing_neighbors = list(neighbor_ids.difference(candidates_map.keys()))
         if missing_neighbors:
             nb = col.get(ids=missing_neighbors, include=["documents", "metadatas"])
@@ -430,7 +428,7 @@ async def ask_question(
                     "chunk_index": meta.get("chunk_index"),
                     "doc_id": meta.get("doc_id"),
                     "upload_time": meta.get("upload_time"),
-                    "similarity": None,  # neighbor added without similarity score
+                    "similarity": None,  # neighbor added without a sim score
                 }
 
         candidates = list(candidates_map.values())
@@ -438,18 +436,15 @@ async def ask_question(
         # D) LLM rerank to find the best small set
         ranked = rank_evidence(q, candidates)[:4]
 
-        # Guard: if everything is weak, ask for clarification or return 404
-        max_sim = max((c.get("similarity") or 0) for c in ranked) if ranked else 0
-        if max_sim < 0.55:
-            # Option A: return a helpful 404 to avoid “I don’t know”
+        # E) Guard: if everything is weak, ask for clarification or return 404
+        max_sim = max((c.get("similarity") or 0) for c in ranked) if ranked else 0.0
+        if max_sim < 0.40 and not any(evidence_is_strong(c) for c in ranked):
             raise HTTPException(
                 status_code=404,
                 detail="I couldn’t find strong matches in your files for this query. Try a longer query (e.g., 'What is a computer program?') or upload more relevant content.",
             )
-            # Option B (alternative): fall back to general knowledge with a disclaimer
-            # ... if your product allows it.
 
-        # E) Build context
+        # F) Build context (prepend summary + recent chat)
         context_parts = []
         if conv_summary.strip():
             context_parts.append(f"Conversation summary:\n{conv_summary}")
@@ -485,12 +480,33 @@ async def ask_question(
                 used += len(block)
             context_parts = trimmed
 
-        # F) Compose answer
+        # G) Decide if we should "must answer"
+        must_answer = any(evidence_is_strong(c) for c in ranked)
+
+        # H) Compose the answer using BOTH original and rewrite as hints
         answer, brief_explanation = compose_answer(
-            q, context_parts, temperature=payload.temperature
+            original_question=q,
+            context_blocks=context_parts,
+            rewrite=r.get("rewrite"),
+            sub_questions=r.get("sub_questions", []),
+            temperature=payload.temperature,
+            must_answer=must_answer,
         )
 
-        # G) Update memory async
+        # I) Fallback: extract a short definition if model still says "I don't know" but evidence is strong
+        fallback_used = False
+        if is_idk(answer) and must_answer and ranked:
+            # If the original query is very short, try extractive fallback from top ranked
+            term = q.strip().strip("?.!").lower()
+            if term and len(term.split()) <= 3:
+                top_text = ranked[0].get("text", "") or ""
+                extracted = extract_short_definition(term, top_text)
+                if extracted:
+                    answer = extracted
+                    brief_explanation = "Extracted from the most relevant snippet."
+                    fallback_used = True
+
+        # J) Update memory async
         background_tasks.add_task(update_memory, user_id, payload.session_id, q, answer)
 
         return {
@@ -501,6 +517,8 @@ async def ask_question(
             "query_used": q,
             "rewritten_query": r.get("rewrite"),
             "sub_questions": r.get("sub_questions", []),
+            "must_answer": must_answer,
+            "fallback_used": fallback_used,
         }
 
     except HTTPException:
