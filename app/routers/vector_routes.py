@@ -439,10 +439,10 @@ async def ask_question(
         # E) Guard: if everything is weak, ask for clarification or return 404
         max_sim = max((c.get("similarity") or 0) for c in ranked) if ranked else 0.0
         if max_sim < 0.40 and not any(evidence_is_strong(c) for c in ranked):
-            raise HTTPException(
-                status_code=404,
-                detail="I couldn’t find strong matches in your files for this query. Try a longer query (e.g., 'What is a computer program?') or upload more relevant content.",
-            )
+            return {
+                "status_code": status.HTTP_200_OK,
+                "answer": "I don't know",
+            }
 
         # F) Build context (prepend summary + recent chat)
         context_parts = []
