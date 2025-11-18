@@ -125,19 +125,20 @@ def compose_answer(
     must_answer: bool = False,
 ) -> Tuple[str, str]:
     """
-    Answer using ONLY the provided context.
-    - Prefer the original question for answering; use rewrite/sub_questions as hints.
-    - If must_answer is True and the context contains relevant evidence, do not return 'I don't know'.
-    Returns (answer, brief_explanation).
+    Use ONLY the provided context to answer.
+    Prefer the original question; use rewrite/sub_questions to disambiguate.
+    If must_answer=True, DO NOT return "I don't know." — extract and summarize from the context.
     """
+    # Put clear constraints in the system message
     system = (
         "Answer the user's original question using ONLY the provided context. "
-        "Prefer the original_question; use rewrite/sub_questions only to disambiguate. "
-        "If the original question is ambiguous but the context clearly supports a likely interpretation, "
-        "infer that interpretation and answer accordingly. "
-        "If must_answer is true and the context contains relevant evidence, do NOT respond with 'I don't know'. "
-        "Only reply exactly 'I don't know.' if the context truly lacks enough information. "
-        "Do not include citations or source markers. No preamble. "
+        "Prefer original_question; use rewrite/sub_questions only to disambiguate. "
+        "The context may include 'Source [n]' blocks (these are the only factual sources) "
+        "and optional conversation notes (not factual sources). "
+        "If must_answer is true, DO NOT respond with 'I don't know.' "
+        "Instead, infer the likely interpretation supported by the sources and answer using quotes or paraphrases from the sources. "
+        "Only if the context truly lacks relevant information may you answer exactly 'I don't know.' "
+        "No citations or source markers in the output. "
         "Respond as JSON: { answer: string, brief_explanation: string }."
     )
     context = "\n\n---\n\n".join(context_blocks)
