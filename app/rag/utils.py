@@ -78,3 +78,20 @@ def strip_domain_preface(answer: str, original_question: str) -> str:
     # Remove leading 'In <domain>,' or 'In <domain> terms,' etc.
     cleaned = re.sub(r"^\s*in [^,]{2,60},\s*", "", answer, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def build_conv_hint(
+    summary: Optional[str], recent_text: Optional[str], max_chars: int = 800
+) -> str:
+    """
+    Build a compact, model-friendly hint from summary + recent messages.
+    The hint is used only by refine_query to resolve references and keep intent.
+    """
+    parts = []
+    if summary and summary.strip():
+        parts.append(f"Summary: {summary.strip()}")
+    if recent_text and recent_text.strip():
+        parts.append(f"Recent: {recent_text.strip()}")
+    hint = "\n".join(parts)
+    # Cap length to keep refiner prompt tight
+    return hint[:max_chars]

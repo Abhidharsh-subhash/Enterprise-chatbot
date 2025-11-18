@@ -14,7 +14,7 @@ from app.dependencies import get_current_user
 from app.schemas.vector import AskRequest
 from app.vector_store.chrome_store import query_user_vectors, get_collection
 from app.utils.embeddings import get_embedding
-from app.rag.reasoning import compose_answer, refine_query, rank_evidence
+from app.rag.reasoning import compose_answer, refine_query_with_history, rank_evidence
 from app.rag.memory import get_summary, get_history, messages_to_text, update_memory
 from app.rag.utils import (
     evidence_is_strong,
@@ -22,8 +22,10 @@ from app.rag.utils import (
     extract_short_definition,
     extractive_answer_from_snippets,
     strip_domain_preface,
+    build_conv_hint,
 )
 from app.core.logger import logger
+import uuid
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -63,21 +65,27 @@ async def ask_question(
             raise HTTPException(status_code=400, detail="Question is required.")
         user_id = str(current_user.id)
 
-        # A) Memory
-        conv_summary = get_summary(user_id, payload.session_id)
+        # 0) Session management: create a session_id if none provided
+        session_id = (payload.session_id or "").strip() or str(uuid.uuid4())
+        session_created = not bool(payload.session_id)
+
+        # A) Memory (scoped to session_id)
+        conv_summary = get_summary(user_id, session_id)
         try:
-            recent_text = messages_to_text(
-                get_history(user_id, payload.session_id).messages
-            )
+            recent_text = messages_to_text(get_history(user_id, session_id).messages)
         except Exception:
             recent_text = ""
 
-        # B) Query rewrite + multi-query retrieval (rewrite used only for retrieval)
+        # Build a compact hint for the refiner from summary + recent turns
+        conv_hint = build_conv_hint(conv_summary, recent_text)
+
+        # B) Query rewrite WITH conversation hint (rewrite used only for retrieval)
         try:
-            r = refine_query(q)
+            r = refine_query_with_history(q, conversation_hint=conv_hint)
         except Exception as e:
-            logger.error(f"refine_query failed: {e}")
+            logger.error(f"refine_query_with_history failed: {e}")
             r = {"rewrite": q, "sub_questions": [], "keywords": []}
+        print(f"refined query : {r}")
 
         search_queries = [q, r.get("rewrite")] + r.get("sub_questions", [])
         search_queries = [s for s in search_queries if s]
@@ -113,7 +121,7 @@ async def ask_question(
                             existing.get("similarity") or 0, sim
                         )
 
-        TOP_K = 6  # raise if you want better reranker material
+        TOP_K = 6
         for sq in search_queries:
             emb = get_embedding(sq)
             res = query_user_vectors(emb, user_id, top_k=TOP_K)
@@ -170,9 +178,14 @@ async def ask_question(
         # E) Guard
         max_sim = max((c.get("similarity") or 0) for c in ranked) if ranked else 0.0
         if max_sim < 0.40 and not any(evidence_is_strong(c) for c in ranked):
-            return {"status_code": status.HTTP_200_OK, "answer": "I don't know."}
+            return {
+                "status_code": status.HTTP_200_OK,
+                "answer": "I don't know.",
+                "session_id": session_id,
+                "session_created": session_created,
+            }
 
-        # F) Build context: Sources FIRST, then optional summary/recent
+        # F) Build context: Sources FIRST, then optional summary/recent (labelled)
         context_parts = []
         sources = []
         for i, c in enumerate(ranked, start=1):
@@ -215,23 +228,25 @@ async def ask_question(
         # G) Decide must_answer
         must_answer = any(evidence_is_strong(c) for c in ranked)
 
-        # H) Composer: STRICTLY answer the original question; include example if asked
+        # H) Composer: strictly answer the original question; include example if asked
         q_lower = q.lower()
         include_example = (
             ("example" in q_lower) or ("e.g." in q_lower) or (" eg " in f" {q_lower} ")
         )
 
         try:
-            answer, brief_explanation = compose_answer(
-                original_question=q,
-                context_blocks=context_parts,
-                temperature=payload.temperature,
-                must_answer=must_answer,
-                include_example=include_example,
-                max_sentences=2,  # adjust to taste
+            answer, brief_explanation = (
+                compose_answer(
+                    original_question=q,
+                    context_blocks=context_parts,
+                    temperature=payload.temperature,
+                    must_answer=must_answer,
+                    include_example=include_example,
+                    max_sentences=2,
+                )
             )
         except Exception as e:
-            logger.error(f"compose_answer_v3 failed: {e}")
+            logger.error(f"compose_answer failed: {e}")
             answer = "I'm sorry, I encountered an issue generating the answer."
             brief_explanation = "Fallback response"
 
@@ -241,7 +256,6 @@ async def ask_question(
         # J) Fallbacks if still IDK but evidence is strong
         fallback_used = False
         if is_idk(answer) and must_answer and ranked:
-            # 1) Extractive fallback from top snippets
             top_snippets = [
                 (ranked[i].get("text") or "") for i in range(min(3, len(ranked)))
             ]
@@ -251,7 +265,6 @@ async def ask_question(
                 brief_explanation = "Extracted from the most relevant snippets."
                 fallback_used = True
             else:
-                # 2) Short-definition fallback for very short queries
                 term = q.strip().strip("?.!").lower()
                 if term and len(term.split()) <= 3:
                     defn = extract_short_definition(
@@ -262,8 +275,8 @@ async def ask_question(
                         brief_explanation = "Extracted from the most relevant snippet."
                         fallback_used = True
 
-        # K) Update memory
-        background_tasks.add_task(update_memory, user_id, payload.session_id, q, answer)
+        # K) Update memory (scoped to this session_id)
+        background_tasks.add_task(update_memory, user_id, session_id, q, answer)
 
         return {
             "status_code": status.HTTP_200_OK,
@@ -275,6 +288,8 @@ async def ask_question(
             "sub_questions": r.get("sub_questions", []),
             "must_answer": must_answer,
             "fallback_used": fallback_used,
+            "session_id": session_id,
+            "session_created": session_created,
         }
 
     except HTTPException:

@@ -33,7 +33,7 @@ def get_summary(user_id: str, session_id: Optional[str]) -> str:
 
 
 def set_summary(
-    user_id: str, session_id: Optional[str], summary: str, ttl_sec: int = 7 * 24 * 3600
+    user_id: str, session_id: Optional[str], summary: str, ttl_sec: int = 24 * 3600
 ):
     key = _summary_key(user_id, session_id)
     _r.set(key, summary)

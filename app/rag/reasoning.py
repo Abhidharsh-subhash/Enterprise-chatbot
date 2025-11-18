@@ -135,3 +135,42 @@ def compose_answer(
     answer = (data.get("answer") or "").strip()
     brief_explanation = (data.get("brief_explanation") or "").strip()
     return answer, brief_explanation
+
+
+def refine_query_with_history(
+    question: str, conversation_hint: Optional[str] = None
+) -> Dict:
+    """
+    Improve retrieval queries using the user's question plus conversation context.
+    - Use conversation_hint (summary + recent turns) ONLY to resolve references and narrow scope.
+    - Do not broaden intent beyond what the user asked.
+    Returns JSON: { rewrite: str, sub_questions: [str], keywords: [str] }
+    """
+    system = (
+        "You refine user questions for retrieval without changing their intent. "
+        "Use the conversation_hint (summary + recent chat) only to resolve references, scope, and ellipses. "
+        "Do not broaden the topic beyond what the user asked. Keep it concise. "
+        "Return JSON: { rewrite: string, sub_questions: array<=3, keywords: array }."
+    )
+    user_payload = {
+        "question": question,
+        "conversation_hint": conversation_hint or "",
+    }
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user_payload)},
+        ],
+    )
+    try:
+        data = json.loads(resp.choices[0].message.content)
+    except Exception:
+        data = {}
+    return {
+        "rewrite": (data.get("rewrite") or question),
+        "sub_questions": (data.get("sub_questions") or [])[:3],
+        "keywords": data.get("keywords") or [],
+    }
