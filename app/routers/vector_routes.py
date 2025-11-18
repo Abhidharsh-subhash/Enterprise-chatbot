@@ -21,6 +21,7 @@ from app.rag.utils import (
     is_idk,
     extract_short_definition,
     extractive_answer_from_snippets,
+    strip_domain_preface,
 )
 from app.core.logger import logger
 
@@ -71,7 +72,7 @@ async def ask_question(
         except Exception:
             recent_text = ""
 
-        # B) Query rewrite + multi-query retrieval
+        # B) Query rewrite + multi-query retrieval (rewrite used only for retrieval)
         try:
             r = refine_query(q)
         except Exception as e:
@@ -112,7 +113,7 @@ async def ask_question(
                             existing.get("similarity") or 0, sim
                         )
 
-        TOP_K = 6
+        TOP_K = 6  # raise if you want better reranker material
         for sq in search_queries:
             emb = get_embedding(sq)
             res = query_user_vectors(emb, user_id, top_k=TOP_K)
@@ -171,7 +172,7 @@ async def ask_question(
         if max_sim < 0.40 and not any(evidence_is_strong(c) for c in ranked):
             return {"status_code": status.HTTP_200_OK, "answer": "I don't know."}
 
-        # F) Build context: put Sources FIRST, then optional summary/recent
+        # F) Build context: Sources FIRST, then optional summary/recent
         context_parts = []
         sources = []
         for i, c in enumerate(ranked, start=1):
@@ -214,31 +215,39 @@ async def ask_question(
         # G) Decide must_answer
         must_answer = any(evidence_is_strong(c) for c in ranked)
 
-        # H) Compose
+        # H) Composer: STRICTLY answer the original question; include example if asked
+        q_lower = q.lower()
+        include_example = (
+            ("example" in q_lower) or ("e.g." in q_lower) or (" eg " in f" {q_lower} ")
+        )
+
         try:
             answer, brief_explanation = compose_answer(
                 original_question=q,
                 context_blocks=context_parts,
-                rewrite=r.get("rewrite"),
-                sub_questions=r.get("sub_questions", []),
                 temperature=payload.temperature,
                 must_answer=must_answer,
+                include_example=include_example,
+                max_sentences=2,  # adjust to taste
             )
         except Exception as e:
-            logger.error(f"compose_answer failed: {e}")
+            logger.error(f"compose_answer_v3 failed: {e}")
             answer = "I'm sorry, I encountered an issue generating the answer."
             brief_explanation = "Fallback response"
 
-        # I) Fallbacks if still IDK but evidence is strong
+        # I) Strip domain prefaces if the user didn't include them
+        answer = strip_domain_preface(answer, q)
+
+        # J) Fallbacks if still IDK but evidence is strong
         fallback_used = False
         if is_idk(answer) and must_answer and ranked:
-            # 1) Extractive general fallback from top 2–3 snippets
+            # 1) Extractive fallback from top snippets
             top_snippets = [
                 (ranked[i].get("text") or "") for i in range(min(3, len(ranked)))
             ]
             extracted = extractive_answer_from_snippets(q, top_snippets)
             if extracted:
-                answer = extracted
+                answer = strip_domain_preface(extracted, q)
                 brief_explanation = "Extracted from the most relevant snippets."
                 fallback_used = True
             else:
@@ -249,11 +258,11 @@ async def ask_question(
                         term, top_snippets[0] if top_snippets else ""
                     )
                     if defn:
-                        answer = defn
+                        answer = strip_domain_preface(defn, q)
                         brief_explanation = "Extracted from the most relevant snippet."
                         fallback_used = True
 
-        # J) Update memory
+        # K) Update memory
         background_tasks.add_task(update_memory, user_id, payload.session_id, q, answer)
 
         return {

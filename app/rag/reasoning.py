@@ -86,69 +86,42 @@ def rank_evidence(question: str, candidates: List[Dict]) -> List[Dict]:
     return ordered
 
 
-# def compose_answer(
-#     question: str, context_blocks: List[str], temperature: float = 0.1
-# ) -> Tuple[str, str]:
-#     """
-#     Step 3: Compose final answer using only selected context.
-#     Returns (answer, brief_explanation). We do not expose full chain-of-thought.
-#     """
-#     system = (
-#         "Answer the user's question using ONLY the provided context. "
-#         "If unknown, reply exactly: I don't know. "
-#         "Do not include citations or source markers. No preamble. "
-#         "Respond as JSON with fields: answer (string), brief_explanation (<= 1 sentence)."
-#     )
-#     context = "\n\n---\n\n".join(context_blocks)
-#     user = json.dumps({"context": context, "question": question})
-#     resp = client.chat.completions.create(
-#         model=CHAT_MODEL,
-#         temperature=temperature,
-#         response_format={"type": "json_object"},
-#         messages=[
-#             {"role": "system", "content": system},
-#             {"role": "user", "content": user},
-#         ],
-#     )
-#     data = json.loads(resp.choices[0].message.content)
-#     answer = (data.get("answer") or "").strip()
-#     brief_explanation = (data.get("brief_explanation") or "").strip()
-#     return answer, brief_explanation
-
-
 def compose_answer(
     original_question: str,
     context_blocks: List[str],
-    rewrite: Optional[str] = None,
-    sub_questions: Optional[List[str]] = None,
-    temperature: float = 0.1,
+    temperature: float = 0.0,
     must_answer: bool = False,
+    include_example: bool = False,
+    max_sentences: int = 2,
 ) -> Tuple[str, str]:
     """
-    Use ONLY the provided context to answer.
-    Prefer the original question; use rewrite/sub_questions to disambiguate.
-    If must_answer=True, DO NOT return "I don't know." — extract and summarize from the context.
+    Answer ONLY the original_question using ONLY the provided context.
+    - Do NOT broaden or add domain qualifiers not present in the question.
+    - Keep it concise (<= max_sentences).
+    - If include_example=True, include exactly one short example drawn from the context.
+    - If must_answer is True and evidence is present, do not return 'I don't know.'
     """
-    # Put clear constraints in the system message
     system = (
-        "Answer the user's original question using ONLY the provided context. "
-        "Prefer original_question; use rewrite/sub_questions only to disambiguate. "
-        "The context may include 'Source [n]' blocks (these are the only factual sources) "
-        "and optional conversation notes (not factual sources). "
-        "If must_answer is true, DO NOT respond with 'I don't know.' "
-        "Instead, infer the likely interpretation supported by the sources and answer using quotes or paraphrases from the sources. "
+        "Answer the user's original_question using ONLY the provided context. "
+        "Do not broaden or add domain qualifiers (e.g., 'in computer science') that are not explicitly present in the question. "
+        "Do not restate the question. Keep the answer concise and direct. "
+        "If include_example is true, include exactly one short example grounded in the context. "
+        "Use at most max_sentences sentences. "
+        "If must_answer is true and relevant evidence exists in the context, do NOT reply 'I don't know.' "
         "Only if the context truly lacks relevant information may you answer exactly 'I don't know.' "
-        "No citations or source markers in the output. "
+        "Do not include citations or source markers. "
         "Respond as JSON: { answer: string, brief_explanation: string }."
     )
+
     context = "\n\n---\n\n".join(context_blocks)
     payload = {
         "context": context,
         "original_question": original_question,
-        "rewrite": rewrite,
-        "sub_questions": sub_questions or [],
         "must_answer": bool(must_answer),
+        "include_example": bool(include_example),
+        "max_sentences": int(max_sentences),
     }
+
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         temperature=temperature,
