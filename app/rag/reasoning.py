@@ -100,6 +100,7 @@ def compose_answer(
     - Keep it concise (<= max_sentences).
     - If include_example=True, include exactly one short example drawn from the context.
     - If must_answer is True and evidence is present, do not return 'I don't know.'
+    - Math/LaTeX: see system prompt below.
     """
     system = (
         "Answer the user's original_question using ONLY the provided context. "
@@ -110,6 +111,17 @@ def compose_answer(
         "If must_answer is true and relevant evidence exists in the context, do NOT reply 'I don't know.' "
         "Only if the context truly lacks relevant information may you answer exactly 'I don't know.' "
         "Do not include citations or source markers. "
+        "\n\n"
+        "Math and LaTeX formatting rules:\n"
+        "- When mathematical notation is needed, typeset it in LaTeX.\n"
+        "- Use $...$ for inline math and $$...$$ for display equations on their own lines.\n"
+        "- Do NOT wrap LaTeX in code fences or HTML; return plain Markdown + LaTeX only.\n"
+        "- Keep to standard LaTeX macros only (e.g., \\frac, \\sum, \\alpha); do not define new macros.\n"
+        "- Ensure the JSON string escapes backslashes (e.g., use \\\\frac not \\frac in the JSON value). "
+        "The consumer will render the string as Markdown with LaTeX.\n"
+        "- Keep display equations self-contained (avoid \\begin{equation} ... \\end{equation}); $$...$$ is sufficient.\n"
+        "- Keep punctuation outside math when possible (e.g., '$a^2+b^2=c^2$.' not '$a^2+b^2=c^2.$').\n"
+        "\n"
         "Respond as JSON: { answer: string, brief_explanation: string }."
     )
 
