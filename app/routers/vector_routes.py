@@ -130,10 +130,10 @@ async def ask_question(
             add_results(res)
 
         if not candidates_map:
-            raise HTTPException(
-                status_code=404,
-                detail="No matching context found. Upload a file first.",
-            )
+            return {
+                "status_code": status.HTTP_200_OK,
+                "answer": "No matching context found. Upload a file first.",
+            }
 
         # C) Neighbor expansion
         def expand_neighbor_ids(_id: str, window: int = 1):
