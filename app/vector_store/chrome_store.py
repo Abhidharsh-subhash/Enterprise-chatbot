@@ -5,7 +5,9 @@ CHROMA_PATH = os.path.abspath("./vector_db")
 
 
 def get_collection():
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    client = chromadb.PersistentClient(
+        path=CHROMA_PATH, settings=chromadb.Settings(anonymized_telemetry=False)
+    )
     # Set space if you want cosine distance
     return client.get_or_create_collection(
         name="documents", metadata={"hnsw:space": "cosine"}
