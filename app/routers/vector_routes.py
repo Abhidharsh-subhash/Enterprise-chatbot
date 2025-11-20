@@ -62,6 +62,7 @@ async def ask_question(
     current_user: Users = Depends(get_current_user),
 ):
     try:
+        logger.info(f"asked the question")
         q = (payload.question or "").strip()
         if not q:
             raise HTTPException(status_code=400, detail="Question is required.")
@@ -128,6 +129,8 @@ async def ask_question(
             emb = get_embedding(sq)
             res = query_user_vectors(emb, user_id, top_k=TOP_K)
             add_results(res)
+        print(f"emb is {emb}")
+        print(f"res is {res}")
 
         if not candidates_map:
             return {
