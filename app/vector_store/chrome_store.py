@@ -19,11 +19,6 @@ def add_to_vector_db(chunks, embeddings, metadatas, ids):
     col.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
 
 
-def add_to_vector_db(chunks, embeddings, metadatas, ids):
-    col = get_collection()
-    col.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
-
-
 def query_user_vectors(query_embedding, user_id: str, top_k: int = 5):
     """
     Return top_k results for this user_id using the query embedding.

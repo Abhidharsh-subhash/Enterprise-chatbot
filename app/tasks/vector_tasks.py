@@ -15,10 +15,11 @@ def process_file_task(file_path: str, user_id: str):
     db = SyncSessionLocal()  # ✅ real sync session
     try:
         file_name = os.path.basename(file_path)
+        print(f"background task started for the file {file_name} of user {user_id}")
 
         # --- text and embedding generation ---
         text = extract_text_from_file(file_path)
-        print(f"text extraction completed:\n{text}")
+        print(f"text extraction completed")
 
         chunks = split_text_into_chunks(text)
         print(f"chunk splitting completed: {len(chunks)} chunks")
@@ -56,11 +57,11 @@ def process_file_task(file_path: str, user_id: str):
         db.add(uploaded_record)
         db.commit()
         db.refresh(uploaded_record)
-        print(f"📁 Added UploadedFiles record with id: {uploaded_record.id}")
+        print(f"📁 Added UploadedFiles record with id: {uploaded_record.id} of user {user_id}")
 
     except Exception as e:
         db.rollback()
-        print(f"❌ Error processing {file_name}: {str(e)}")
+        print(f"❌ Error processing {file_name} with user {user_id}: {str(e)}")
 
     finally:
         db.close()
