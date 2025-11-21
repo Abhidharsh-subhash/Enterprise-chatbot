@@ -93,7 +93,7 @@ async def ask_question(
         except Exception as e:
             logger.error(f"refine_query_with_history failed: {e}")
             r = {"rewrite": q, "sub_questions": [], "keywords": []}
-        print(f"refined query with history : {r}")
+        logger.info(f"refined query with history : {r}")
 
         search_queries = [q, r.get("rewrite")] + r.get("sub_questions", [])
         search_queries = [s for s in search_queries if s]
@@ -128,10 +128,14 @@ async def ask_question(
                         existing["similarity"] = max(
                             existing.get("similarity") or 0, sim
                         )
-        
+
         logger.info(f"Search queries: {search_queries}")
         for sq in search_queries:
-            emb = get_embedding(sq)
+            try:
+                emb = get_embedding(sq)
+            except Exception as e:
+                logger.error(f"get embedding error: {e}")
+                raise
             try:
                 res = query_user_vectors(emb, user_id, top_k=4)
             except Exception as e:
