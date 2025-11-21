@@ -164,10 +164,12 @@ def refine_query_with_history(
         "Do not broaden the topic beyond what the user asked. Keep it concise. "
         "Return JSON: { rewrite: string, sub_questions: array<=3, keywords: array }."
     )
+    print("after system")
     user_payload = {
         "question": question,
         "conversation_hint": conversation_hint or "",
     }
+    print("after user_payload")
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         temperature=0,
@@ -177,6 +179,7 @@ def refine_query_with_history(
             {"role": "user", "content": json.dumps(user_payload)},
         ],
     )
+    print("after resp")
     try:
         data = json.loads(resp.choices[0].message.content)
     except Exception:
