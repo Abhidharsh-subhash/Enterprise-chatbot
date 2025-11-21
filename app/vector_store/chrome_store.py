@@ -1,7 +1,6 @@
 import os
 import chromadb
 from app.core.logger import logger
-import numpy as np
 
 CHROMA_PATH = os.path.abspath("./vector_db")
 
@@ -27,24 +26,23 @@ def query_user_vectors(query_embedding, user_id: str, top_k: int = 5):
     """
     logger.info("before get_collection")
     col = get_collection()
-    logger.info(f"before converting the type of embedding is {type(query_embedding)}")
-    # --- CRITICAL FIX: SANITIZE INPUT ---
-    # The C++ layer crashes if it gets a Numpy Array or Tensor directly.
-    # We must force it into a standard Python List[float].
+    logger.info(f"the type of embedding is {type(query_embedding)}")
 
-    # 1. Convert from Tensor/Numpy to List
-    if hasattr(query_embedding, "tolist"):
-        query_embedding = query_embedding.tolist()
-    elif isinstance(query_embedding, np.ndarray):
-        query_embedding = query_embedding.tolist()
+    try:
+        peek = col.peek(limit=1)
+        if peek["embeddings"]:
+            expected_dim = len(peek["embeddings"][0])
+            actual_dim = len(query_embedding)
+            logger.info(
+                f"DEBUG: Collection Dim: {expected_dim}, Query Dim: {actual_dim}"
+            )
 
-    # 2. Ensure it's a flat list of floats (not a list of lists for a single query)
-    # If embedding came in as [[0.1, 0.2]], flatten it to [0.1, 0.2]
-    if len(query_embedding) > 0 and isinstance(query_embedding[0], list):
-        query_embedding = query_embedding[0]
+            if expected_dim != actual_dim:
+                logger.error("CRITICAL: Dimension mismatch! This will crash the app.")
+                return {"error": "Dimension mismatch"}  # Return early to save the app
+    except Exception as e:
+        logger.warning(f"Could not verify dimensions: {e}")
 
-    logger.info(f"Sanitized query_embedding type: {type(query_embedding)}")
-    # -------
     try:
         results = col.query(
             query_embeddings=[query_embedding],
