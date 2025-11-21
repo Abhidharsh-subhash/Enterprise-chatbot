@@ -36,5 +36,6 @@ def query_user_vectors(query_embedding, user_id: str, top_k: int = 5):
         )
     except Exception as e:
         logger.error(f"The issue in results value is : {e}")
+        raise
     logger.info("after results")
     return results
