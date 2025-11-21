@@ -26,7 +26,9 @@ def query_user_vectors(query_embedding, user_id: str, top_k: int = 5):
     """
     logger.info("before get_collection")
     col = get_collection()
-    logger.info("after get_collection")
+    logger.info(
+        f"after get_collection query embedding is {query_embedding} of type {type(query_embedding)}"
+    )
     try:
         results = col.query(
             query_embeddings=[query_embedding],
