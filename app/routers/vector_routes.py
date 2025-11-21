@@ -84,15 +84,16 @@ async def ask_question(
 
         # Build a compact hint for the refiner from summary + recent turns
         conv_hint = build_conv_hint(conv_summary, recent_text)
-        logger.info("con_hint is created")
+        logger.info("conv_hint is created")
 
+        logger.info("Before refine_query_with_history")
         # B) Query rewrite WITH conversation hint (rewrite used only for retrieval)
         try:
             r = refine_query_with_history(q, conversation_hint=conv_hint)
         except Exception as e:
             logger.error(f"refine_query_with_history failed: {e}")
             r = {"rewrite": q, "sub_questions": [], "keywords": []}
-        print(f"refined query : {r}")
+        print(f"refined query with history : {r}")
 
         search_queries = [q, r.get("rewrite")] + r.get("sub_questions", [])
         search_queries = [s for s in search_queries if s]
@@ -127,11 +128,15 @@ async def ask_question(
                         existing["similarity"] = max(
                             existing.get("similarity") or 0, sim
                         )
-
-        TOP_K = 6
+        
+        logger.info(f"Search queries: {search_queries}")
         for sq in search_queries:
             emb = get_embedding(sq)
-            res = query_user_vectors(emb, user_id, top_k=TOP_K)
+            try:
+                res = query_user_vectors(emb, user_id, top_k=4)
+            except Exception as e:
+                logger.error(f"vector DB query error: {e}")
+                raise
             add_results(res)
         print(f"emb is {emb}")
         print(f"res is {res}")
