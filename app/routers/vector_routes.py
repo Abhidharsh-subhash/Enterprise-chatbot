@@ -67,10 +67,12 @@ async def ask_question(
         if not q:
             raise HTTPException(status_code=400, detail="Question is required.")
         user_id = str(current_user.id)
+        logger.info(f"user_id fetched is {user_id}")
 
         # 0) Session management: create a session_id if none provided
         session_id = (payload.session_id or "").strip() or str(uuid.uuid4())
         session_created = not bool(payload.session_id)
+        logger.info("handled the session_id")
 
         # A) Memory (scoped to session_id)
         conv_summary = get_summary(user_id, session_id)
@@ -78,9 +80,11 @@ async def ask_question(
             recent_text = messages_to_text(get_history(user_id, session_id).messages)
         except Exception:
             recent_text = ""
+        logger.info("conv summary if fetched")
 
         # Build a compact hint for the refiner from summary + recent turns
         conv_hint = build_conv_hint(conv_summary, recent_text)
+        logger.info("con_hint is created")
 
         # B) Query rewrite WITH conversation hint (rewrite used only for retrieval)
         try:
