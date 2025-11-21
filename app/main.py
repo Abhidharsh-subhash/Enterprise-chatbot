@@ -5,10 +5,11 @@ import sys
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 # --- CHROMADB FIX END ---
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from app.core.events import lifespan
 from app.routers import api_router
 from fastapi.middleware.cors import CORSMiddleware
+import sqlite3
 
 app = FastAPI(title="self-hosted chatbot", lifespan=lifespan)
 app.include_router(api_router)
@@ -25,4 +26,4 @@ app.add_middleware(
 
 @app.get("/test")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "Hello World", "sqlite_version": sqlite3.sqlite_version}
