@@ -117,6 +117,7 @@ Pygments==2.19.2
 pypdf==6.1.1
 PyPika==0.48.9
 pyproject_hooks==1.2.0
+pysqlite3-binary==0.5.4
 python-dateutil==2.9.0.post0
 python-docx==1.2.0
 python-dotenv==1.1.1

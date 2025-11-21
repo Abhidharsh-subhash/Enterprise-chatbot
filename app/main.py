@@ -1,3 +1,10 @@
+# --- CHROMADB FIX START (MUST BE AT THE TOP) ---
+__import__("pysqlite3")
+import sys
+
+sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+# --- CHROMADB FIX END ---
+
 from fastapi import FastAPI, Request
 from app.core.events import lifespan
 from app.routers import api_router
@@ -15,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],  # allow all headers
 )
 
+
 @app.get("/test")
 async def root():
     return {"message": "Hello World"}
-
