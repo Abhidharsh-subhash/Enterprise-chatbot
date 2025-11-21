@@ -2,7 +2,7 @@ import os
 import chromadb
 from app.core.logger import logger
 
-CHROMA_PATH = os.path.abspath("./vector_db")
+CHROMA_PATH = os.path.abspath("./vectordb")
 
 
 def get_collection():
