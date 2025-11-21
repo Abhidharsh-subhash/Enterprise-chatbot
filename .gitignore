@@ -5,3 +5,4 @@ versions
 uploads
 vector_db
 logs
+test.py

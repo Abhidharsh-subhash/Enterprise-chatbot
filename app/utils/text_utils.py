@@ -1,18 +1,52 @@
 from typing import List
 from pypdf import PdfReader
 from docx import Document
+import pandas as pd
 
 
 def extract_text_from_file(file_path: str) -> str:
+    # 1. PDF
     if file_path.endswith(".pdf"):
         reader = PdfReader(file_path)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
+    # 2. DOCX
     elif file_path.endswith(".docx"):
         doc = Document(file_path)
         return "\n".join(p.text for p in doc.paragraphs)
+    # 3. TXT
     elif file_path.endswith(".txt"):
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
+    # 4. EXCEL (Optimized for Vector DB / Embeddings)
+    elif file_path.endswith(".xlsx") or file_path.endswith(".xls"):
+        try:
+            # Read all sheets
+            all_sheets = pd.read_excel(file_path, sheet_name=None)
+            text_parts = []
+
+            for sheet_name, df in all_sheets.items():
+                if df.empty:
+                    continue
+
+                # Convert all data to string and handle NaN
+                df = df.fillna("").astype(str)
+
+                text_parts.append(f"\n--- Sheet: {sheet_name} ---\n")
+
+                # Method: Convert each row into a sentence/context string
+                # This ensures that if the text is chunked, the context is preserved.
+                for _, row in df.iterrows():
+                    # Creates a string like: "Column1: Value1 | Column2: Value2 | ..."
+                    row_text = " | ".join(
+                        [f"{col}: {val}" for col, val in row.items() if val]
+                    )
+                    text_parts.append(row_text)
+
+            return "\n".join(text_parts)
+
+        except Exception as e:
+            raise ValueError(f"Error processing Excel file: {e}")
+
     else:
         raise ValueError("Unsupported file format")
 
