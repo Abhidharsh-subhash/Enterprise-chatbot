@@ -133,11 +133,13 @@ async def ask_question(
         for sq in search_queries:
             try:
                 emb = get_embedding(sq)
+                logger.info(f"get embedding has no error")
             except Exception as e:
                 logger.error(f"get embedding error: {e}")
                 raise
             try:
                 res = query_user_vectors(emb, user_id, top_k=4)
+                logger.info(f"query user vecotrs has no error")
             except Exception as e:
                 logger.error(f"vector DB query error: {e}")
                 raise
