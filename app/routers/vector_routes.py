@@ -28,7 +28,6 @@ from app.rag.utils import (
 from app.core.logger import logger
 import uuid
 from typing import Dict, Any
-from app.rag.pandas_utils import analyze_excel_intent, run_pandas_logic
 from app.rag.pandas_executor import execute_pandas_retrieval
 from app.core.openai_client import client, CHAT_MODEL
 
