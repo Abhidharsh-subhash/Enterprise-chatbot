@@ -28,6 +28,7 @@ from app.rag.utils import (
 from app.core.logger import logger
 import uuid
 from typing import Dict, Any
+from app.rag.pandas_utils import analyze_excel_intent, run_pandas_logic
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -144,14 +145,71 @@ async def ask_question(
                 logger.error(f"vector DB query error: {e}")
                 raise
             add_results(res)
-        print(f"emb is {emb}")
-        print(f"res is {res}")
+        # print(f"emb is {emb}")
+        # print(f"res is {res}")
 
         if not candidates_map:
             return {
                 "status_code": status.HTTP_200_OK,
                 "answer": "No matching context found. Upload a file first.",
             }
+
+        # -------------------------------------------------------------------------
+        # ### NEW LOGIC STARTS HERE ###
+        # -------------------------------------------------------------------------
+
+        # 1. Get the absolute best candidate based on similarity
+        # We convert dict values to a list and sort by similarity
+        all_candidates = list(candidates_map.values())
+        best_candidate = sorted(
+            all_candidates, key=lambda x: x.get("similarity") or 0, reverse=True
+        )[0]
+
+        file_name = best_candidate.get("file_name", "")
+
+        # 2. Check if it is an Excel file
+        if file_name and (file_name.endswith(".xlsx") or file_name.endswith(".xls")):
+            logger.info(f"Top match is an Excel file: {file_name}. Checking intent...")
+
+            # 3. Check Intent (Analytic vs Lookup)
+            intent = analyze_excel_intent(q)
+            logger.info(f"Query Intent Classified as: {intent}")
+
+            if intent == "ANALYTIC":
+                print("pandas")
+                logger.info("Triggering Pandas Logic...")
+
+                # 4. Run Pandas Logic
+                # We run this synchronously here.
+                # Since it returns the final answer, we return immediately.
+                pandas_answer = run_pandas_logic(file_name, q)
+
+                # Update memory for the session
+                background_tasks.add_task(
+                    update_memory, user_id, session_id, q, pandas_answer
+                )
+
+                return {
+                    "status_code": status.HTTP_200_OK,
+                    "answer": pandas_answer,
+                    "brief_explanation": "Calculated directly from the Excel data.",
+                    "sources": [
+                        {
+                            "file_name": file_name,
+                            "rank": 1,
+                            "type": "direct_calculation",
+                        }
+                    ],
+                    "query_used": q,
+                    "must_answer": True,
+                    "session_id": session_id,
+                    "session_created": session_created,
+                }
+
+        # -------------------------------------------------------------------------
+        # ### NEW LOGIC ENDS HERE ###
+        # If not Analytic Excel, proceed with standard RAG below
+        # -------------------------------------------------------------------------
 
         # C) Neighbor expansion
         def expand_neighbor_ids(_id: str, window: int = 1):

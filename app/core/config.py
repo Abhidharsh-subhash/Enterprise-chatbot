@@ -39,6 +39,7 @@ class Settings(BaseSettings):
 
     # COT
     memory_url: str = Field(env="MEMORY_URL")
+    vector_database: str = Field(env="VECTOR_DATABASE")
 
     class Config:
         env_file = ".env"

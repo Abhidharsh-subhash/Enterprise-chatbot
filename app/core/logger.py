@@ -13,7 +13,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(LOG_FILE),  # Write logs to file
-        logging.StreamHandler(),  # Show logs in console too
+        # logging.StreamHandler(),  # Show logs in console too
     ],
 )
 
