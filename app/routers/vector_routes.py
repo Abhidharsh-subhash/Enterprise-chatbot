@@ -30,6 +30,7 @@ import uuid
 from typing import Dict, Any
 from app.rag.pandas_utils import analyze_excel_intent, run_pandas_logic
 from app.rag.pandas_executor import execute_pandas_retrieval
+from app.core.openai_client import client, CHAT_MODEL
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -199,7 +200,6 @@ async def ask_question(
 
         # =========================================================================
         # NEW LOGIC: EXCEL INTERCEPTOR
-        # Placed HERE to avoid 'UnboundLocalError' regarding 'ranked'
         # =========================================================================
 
         # 1. Check the single best file
@@ -210,21 +210,34 @@ async def ask_question(
         if is_excel:
             logger.info(f"Excel Detected ({file_name}). Switching to Pandas Executor.")
             try:
-                # 2. Execute Pandas (Handles BOTH Analytics & Specific Lookups)
+                # 2. Execute Pandas to get the RAW data (e.g., "9840204060" or "419")
                 raw_data = execute_pandas_retrieval(file_name, q)
 
-                # 3. Compose Answer (Wraps the raw data in natural language)
-                # We pretend the raw data is the "context"
-                answer, brief_explanation = compose_answer(
-                    original_question=q,
-                    context_blocks=[f"Data retrieved from {file_name}:\n{raw_data}"],
-                    temperature=payload.temperature,
-                    must_answer=True,  # We have exact data
-                    include_example=False,
-                    max_sentences=3,
+                # 2. Generate a Precise Response
+                # We change the prompt to allow Tables and Lists
+                nl_system_prompt = (
+                    "You are a precise data assistant. "
+                    "I will provide raw data retrieved from an Excel file based on a user's query. "
+                    "\n\nRULES:"
+                    "\n1. If the data contains multiple records/rows, format them as a clean **Markdown Table** or a structured list. Do NOT summarize vague details (e.g. do not say 'There are 3 records', show the records)."
+                    "\n2. If the data is a single value (like a count or one specific phone number), state it in a natural sentence."
+                    "\n3. Present exactly what is returned in the raw data without omitting columns."
                 )
 
-                # 4. Return Early (Skip standard context building)
+                nl_user_prompt = f"User Query: {q}\n\nRaw Database Result:\n{raw_data}"
+
+                nl_response = client.chat.completions.create(
+                    model=CHAT_MODEL,
+                    messages=[
+                        {"role": "system", "content": nl_system_prompt},
+                        {"role": "user", "content": nl_user_prompt},
+                    ],
+                    temperature=0,  # Slightly higher for natural flow
+                )
+
+                answer = nl_response.choices[0].message.content.strip()
+
+                # 4. Return Early
                 background_tasks.add_task(update_memory, user_id, session_id, q, answer)
 
                 return {
@@ -246,7 +259,6 @@ async def ask_question(
                 )
                 # If Pandas fails, we simply do nothing here and let the code
                 # flow down to 'E) Guard' and 'F) Build context'
-
         # =========================================================================
         # END NEW LOGIC - Standard RAG continues below
         # =========================================================================
