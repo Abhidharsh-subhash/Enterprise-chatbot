@@ -29,6 +29,7 @@ from app.core.logger import logger
 import uuid
 from typing import Dict, Any
 from app.rag.pandas_utils import analyze_excel_intent, run_pandas_logic
+from app.rag.pandas_executor import execute_pandas_retrieval
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -154,63 +155,6 @@ async def ask_question(
                 "answer": "No matching context found. Upload a file first.",
             }
 
-        # -------------------------------------------------------------------------
-        # ### NEW LOGIC STARTS HERE ###
-        # -------------------------------------------------------------------------
-
-        # 1. Get the absolute best candidate based on similarity
-        # We convert dict values to a list and sort by similarity
-        all_candidates = list(candidates_map.values())
-        best_candidate = sorted(
-            all_candidates, key=lambda x: x.get("similarity") or 0, reverse=True
-        )[0]
-
-        file_name = best_candidate.get("file_name", "")
-
-        # 2. Check if it is an Excel file
-        if file_name and (file_name.endswith(".xlsx") or file_name.endswith(".xls")):
-            logger.info(f"Top match is an Excel file: {file_name}. Checking intent...")
-
-            # 3. Check Intent (Analytic vs Lookup)
-            intent = analyze_excel_intent(q)
-            logger.info(f"Query Intent Classified as: {intent}")
-
-            if intent == "ANALYTIC":
-                print("pandas")
-                logger.info("Triggering Pandas Logic...")
-
-                # 4. Run Pandas Logic
-                # We run this synchronously here.
-                # Since it returns the final answer, we return immediately.
-                pandas_answer = run_pandas_logic(file_name, q)
-
-                # Update memory for the session
-                background_tasks.add_task(
-                    update_memory, user_id, session_id, q, pandas_answer
-                )
-
-                return {
-                    "status_code": status.HTTP_200_OK,
-                    "answer": pandas_answer,
-                    "brief_explanation": "Calculated directly from the Excel data.",
-                    "sources": [
-                        {
-                            "file_name": file_name,
-                            "rank": 1,
-                            "type": "direct_calculation",
-                        }
-                    ],
-                    "query_used": q,
-                    "must_answer": True,
-                    "session_id": session_id,
-                    "session_created": session_created,
-                }
-
-        # -------------------------------------------------------------------------
-        # ### NEW LOGIC ENDS HERE ###
-        # If not Analytic Excel, proceed with standard RAG below
-        # -------------------------------------------------------------------------
-
         # C) Neighbor expansion
         def expand_neighbor_ids(_id: str, window: int = 1):
             try:
@@ -252,6 +196,60 @@ async def ask_question(
             ranked = sorted(
                 candidates, key=lambda c: c.get("similarity") or 0, reverse=True
             )[:3]
+
+        # =========================================================================
+        # NEW LOGIC: EXCEL INTERCEPTOR
+        # Placed HERE to avoid 'UnboundLocalError' regarding 'ranked'
+        # =========================================================================
+
+        # 1. Check the single best file
+        top_candidate = ranked[0] if ranked else None
+        file_name = top_candidate.get("file_name", "") if top_candidate else ""
+        is_excel = file_name.lower().endswith((".xlsx", ".xls"))
+
+        if is_excel:
+            logger.info(f"Excel Detected ({file_name}). Switching to Pandas Executor.")
+            try:
+                # 2. Execute Pandas (Handles BOTH Analytics & Specific Lookups)
+                raw_data = execute_pandas_retrieval(file_name, q)
+
+                # 3. Compose Answer (Wraps the raw data in natural language)
+                # We pretend the raw data is the "context"
+                answer, brief_explanation = compose_answer(
+                    original_question=q,
+                    context_blocks=[f"Data retrieved from {file_name}:\n{raw_data}"],
+                    temperature=payload.temperature,
+                    must_answer=True,  # We have exact data
+                    include_example=False,
+                    max_sentences=3,
+                )
+
+                # 4. Return Early (Skip standard context building)
+                background_tasks.add_task(update_memory, user_id, session_id, q, answer)
+
+                return {
+                    "status_code": status.HTTP_200_OK,
+                    "answer": answer,
+                    "brief_explanation": "Derived directly from Excel data.",
+                    "sources": [
+                        {"file_name": file_name, "rank": 1, "type": "pandas_exact"}
+                    ],
+                    "query_used": q,
+                    "must_answer": True,
+                    "session_id": session_id,
+                    "session_created": session_created,
+                }
+
+            except Exception as pd_error:
+                logger.error(
+                    f"Pandas execution failed: {pd_error}. Falling back to standard RAG."
+                )
+                # If Pandas fails, we simply do nothing here and let the code
+                # flow down to 'E) Guard' and 'F) Build context'
+
+        # =========================================================================
+        # END NEW LOGIC - Standard RAG continues below
+        # =========================================================================
 
         # E) Guard
         max_sim = max((c.get("similarity") or 0) for c in ranked) if ranked else 0.0
