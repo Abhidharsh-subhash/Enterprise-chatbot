@@ -507,7 +507,7 @@ async def ask_question(
             )[:3]
 
         # =========================================================================
-        # EXCEL INTERCEPTOR (Kept as requested)
+        # EXCEL INTERCEPTOR
         # =========================================================================
 
         # 1. Check the single best file
@@ -518,20 +518,24 @@ async def ask_question(
         if is_excel:
             logger.info(f"Excel Detected ({file_name}). Switching to Pandas Executor.")
             try:
-                # 2. Execute Pandas to get the RAW data
+                # 2. Execute Pandas to get the ACCURATE Result (Rows or Calculated Number)
+                # This calls the updated function we discussed
                 raw_data = execute_pandas_retrieval(file_name, q)
 
-                # 3. Generate a Precise Response
+                # 3. Generate a Precise Response (The "Second" OpenAI call)
+                # We update the prompt to handle specific calculated answers better.
                 nl_system_prompt = (
-                    "You are a precise data assistant. "
-                    "I will provide raw data retrieved from an Excel file based on a user's query. "
+                    "You are a data analyst assistant. "
+                    "I will provide a User Query and the 'Raw Execution Result' derived from running Python code on the Excel file. "
                     "\n\nRULES:"
-                    "\n1. If the data contains multiple records/rows, format them as a clean **Markdown Table** or a structured list."
-                    "\n2. If the data is a single value, state it in a natural sentence."
-                    "\n3. Present exactly what is returned in the raw data without omitting columns."
+                    "\n1. **Calculated Values**: If the result is a single number (count, sum, average), answer the user's question directly with that number in a sentence."
+                    "\n2. **Data Lists**: If the result is a table/list, format it as a clean Markdown Table."
+                    "\n3. **No Match**: If the raw result is exactly 'NO_MATCH' or an empty table/dataframe, clearly say there are no records matching the user query."
+                    "\n4. **Errors**: If the result mentions an error, politely explain that the data couldn't be calculated."
+                    "\n5. Do not hallucinate data not present in the 'Raw Execution Result'."
                 )
 
-                nl_user_prompt = f"User Query: {q}\n\nRaw Database Result:\n{raw_data}"
+                nl_user_prompt = f"User Query: {q}\n\nRaw Execution Result:\n{raw_data}"
 
                 nl_response = client.chat.completions.create(
                     model=CHAT_MODEL,
@@ -544,13 +548,13 @@ async def ask_question(
 
                 answer = nl_response.choices[0].message.content.strip()
 
-                # 4. Return Early (Update memory for record keeping, even if not reading it)
+                # 4. Return Early
                 background_tasks.add_task(update_memory, user_id, session_id, q, answer)
 
                 return {
                     "status_code": status.HTTP_200_OK,
                     "answer": answer,
-                    "brief_explanation": "Derived directly from Excel data.",
+                    "brief_explanation": "Calculated directly from the Excel file.",
                     "sources": [
                         {"file_name": file_name, "rank": 1, "type": "pandas_exact"}
                     ],
@@ -564,9 +568,11 @@ async def ask_question(
                 logger.error(
                     f"Pandas execution failed: {pd_error}. Falling back to standard RAG."
                 )
+                # If pandas fails, the code will automatically continue down
+                # to the 'Standard RAG' section below.
 
         # =========================================================================
-        # Standard RAG (No History Context)
+        # Standard RAG (Contextual Fallback)
         # =========================================================================
 
         # E) Guard
