@@ -1,488 +1,598 @@
 # pandas_executor.py
-import os, re
+import os
+import re
 import pandas as pd
 import traceback
-from collections import Counter
+from typing import Optional, List, Dict, Any, Tuple
 from app.core.openai_client import client, CHAT_MODEL
 from app.core.logger import logger
 
 UPLOADS_DIR = os.path.abspath("./uploads")
 
+# Your fixed Excel date format
+EXCEL_DATE_FORMAT = "%m/%d/%Y %H:%M:%S"
 
-class DataFrameAnalyzer:
+
+class DynamicQueryEngine:
     """
-    Analyzes a DataFrame to understand its structure dynamically.
-    No hardcoded field names or values.
+    A fully dynamic query engine that learns everything from the data.
+    No hardcoded mappings or assumptions about column names/values.
     """
 
     def __init__(self, df: pd.DataFrame):
         self.df = df
-        self.column_profiles = {}
-        self._analyze_columns()
+        self.columns = list(df.columns)
+        self.column_profiles = self._profile_all_columns()
 
-    def _analyze_columns(self):
+    def _profile_all_columns(self) -> Dict[str, Dict]:
         """
-        Profile each column to understand its nature:
-        - cardinality (unique values)
-        - data type
-        - value frequency distribution
-        - likely column purpose
+        Profile every column to understand its characteristics.
+        Everything is learned from the data itself.
         """
-        for col in self.df.columns:
+        profiles = {}
+
+        for col in self.columns:
             series = self.df[col]
             non_null = series.dropna()
 
             profile = {
                 "name": col,
                 "dtype": str(series.dtype),
-                "total_rows": len(series),
-                "non_null_count": len(non_null),
+                "null_count": series.isna().sum(),
+                "total_count": len(series),
                 "unique_count": series.nunique(),
-                "cardinality_ratio": series.nunique() / max(len(series), 1),
-                "sample_values": [],
-                "value_frequencies": {},
-                "is_categorical": False,
-                "is_identifier": False,
-                "is_date": False,
-                "is_numeric": False,
-                "is_text_heavy": False,
+                "unique_ratio": series.nunique() / max(len(series), 1),
             }
 
-            # Determine column type
-            if pd.api.types.is_datetime64_any_dtype(series):
-                profile["is_date"] = True
-            elif pd.api.types.is_numeric_dtype(series):
-                profile["is_numeric"] = True
+            # Detect if numeric
+            if pd.api.types.is_numeric_dtype(series):
+                profile["type"] = "numeric"
+                profile["min"] = float(series.min()) if len(non_null) > 0 else None
+                profile["max"] = float(series.max()) if len(non_null) > 0 else None
+                profile["mean"] = float(series.mean()) if len(non_null) > 0 else None
+
+            # Detect if datetime
+            elif pd.api.types.is_datetime64_any_dtype(series):
+                profile["type"] = "datetime"
+
+            # For object/string columns
             else:
-                # Try to detect dates in string columns
-                if self._looks_like_date_column(non_null):
-                    profile["is_date"] = True
-                # Check if it's categorical (low cardinality) vs free text
-                elif (
-                    profile["cardinality_ratio"] < 0.3 and profile["unique_count"] < 100
-                ):
-                    profile["is_categorical"] = True
-                elif profile["cardinality_ratio"] > 0.8:
-                    profile["is_identifier"] = True
+                # Try to detect if it's a date column by parsing
+                is_date = self._detect_date_column(non_null)
+
+                if is_date:
+                    profile["type"] = "datetime"
                 else:
-                    # Check average text length
-                    avg_len = (
-                        non_null.astype(str).str.len().mean()
-                        if len(non_null) > 0
-                        else 0
-                    )
-                    profile["is_text_heavy"] = avg_len > 50
+                    profile["type"] = "text"
 
-            # Get sample values and frequencies for categorical columns
-            if profile["is_categorical"] and len(non_null) > 0:
-                value_counts = non_null.value_counts()
-                profile["value_frequencies"] = value_counts.head(20).to_dict()
-                profile["sample_values"] = list(value_counts.head(10).index)
-            elif len(non_null) > 0:
-                profile["sample_values"] = list(non_null.head(5).astype(str))
+                    # Store unique values if cardinality is low (categorical-like)
+                    if profile["unique_count"] <= 100:
+                        profile["unique_values"] = [
+                            str(v) for v in non_null.unique().tolist()
+                        ]
 
-            self.column_profiles[col] = profile
+                    # Store sample values for high cardinality columns
+                    profile["sample_values"] = [
+                        str(v) for v in non_null.head(20).tolist()
+                    ]
 
-    def _looks_like_date_column(self, series) -> bool:
-        """Check if a string column contains date-like values."""
+            profiles[col] = profile
+
+        return profiles
+
+    def _detect_date_column(self, series: pd.Series) -> bool:
+        """Detect if a series contains date values using the known format."""
         if len(series) == 0:
             return False
 
-        sample = series.head(20).astype(str)
         try:
-            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+            sample = series.head(20).astype(str)
+            parsed = pd.to_datetime(sample, format=EXCEL_DATE_FORMAT, errors="coerce")
             valid_ratio = parsed.notna().sum() / len(sample)
             return valid_ratio > 0.7
         except Exception:
             return False
 
-    def get_categorical_columns(self) -> list:
-        """Return columns that have categorical/enumerable values."""
-        return [
-            col
-            for col, profile in self.column_profiles.items()
-            if profile["is_categorical"]
-        ]
-
-    def get_date_columns(self) -> list:
-        """Return columns that contain dates."""
-        return [
-            col for col, profile in self.column_profiles.items() if profile["is_date"]
-        ]
-
-    def get_identifier_columns(self) -> list:
-        """Return columns that likely contain unique identifiers (names, IDs, etc.)."""
-        return [
-            col
-            for col, profile in self.column_profiles.items()
-            if profile["is_identifier"] or profile["cardinality_ratio"] > 0.5
-        ]
-
-    def get_all_categorical_values(self) -> dict:
-        """Get all known categorical values per column."""
-        return {
-            col: profile["sample_values"]
-            for col, profile in self.column_profiles.items()
-            if profile["is_categorical"] and profile["sample_values"]
-        }
-
-    def find_value_in_data(self, search_term: str) -> list:
+    def find_value_in_dataframe(self, search_term: str) -> List[Dict]:
         """
-        Find which columns contain the search term and how often.
-        Returns list of (column, match_count, match_ratio, matched_values)
+        Search for a term across ALL columns and return where it's found.
+        Completely data-driven - no assumptions.
         """
-        search_lower = search_term.lower().strip()
-        results = []
+        search_lower = str(search_term).lower().strip()
+        findings = []
 
-        for col in self.df.columns:
+        for col in self.columns:
+            profile = self.column_profiles[col]
+
+            # Skip numeric and date columns for text search
+            if profile["type"] in ["numeric", "datetime"]:
+                continue
+
             series = self.df[col].astype(str).str.lower()
 
-            # Exact match
+            # Check for exact matches
             exact_mask = series == search_lower
             exact_count = exact_mask.sum()
 
-            # Partial/substring match
+            # Check for partial/contains matches
             try:
-                partial_mask = series.str.contains(re.escape(search_lower), na=False)
-                partial_count = partial_mask.sum()
+                contains_mask = series.str.contains(re.escape(search_lower), na=False)
+                contains_count = contains_mask.sum()
             except Exception:
-                partial_mask = series.apply(lambda x: search_lower in str(x).lower())
-                partial_count = partial_mask.sum()
+                contains_mask = pd.Series(False, index=self.df.index)
+                contains_count = 0
 
-            if partial_count > 0:
+            if contains_count > 0:
                 # Get the actual matched values
-                matched_values = self.df.loc[partial_mask, col].unique()[:5]
-                results.append(
+                matched_rows = self.df[contains_mask]
+                matched_values = matched_rows[col].unique()[:5]
+
+                findings.append(
                     {
                         "column": col,
                         "exact_matches": int(exact_count),
-                        "partial_matches": int(partial_count),
-                        "match_ratio": partial_count / len(self.df),
+                        "contains_matches": int(contains_count),
+                        "selectivity": contains_count
+                        / len(self.df),  # Lower = more selective
                         "matched_values": [str(v) for v in matched_values],
-                        "is_categorical": self.column_profiles[col]["is_categorical"],
+                        "mask": contains_mask,
                     }
                 )
 
-        # Sort by: categorical columns first, then by match ratio (prefer selective matches)
-        results.sort(
-            key=lambda x: (
-                -x["is_categorical"],  # Categorical first
-                x["match_ratio"] if x["match_ratio"] < 0.5 else 1,  # Prefer selective
-                -x["partial_matches"],  # Then by count
-            )
-        )
+        # Sort by selectivity (most selective first) - prefer columns where the term is rare
+        findings.sort(key=lambda x: (x["selectivity"], -x["exact_matches"]))
 
-        return results
+        return findings
 
-    def get_column_summary(self) -> str:
-        """Generate a summary of the dataframe structure for the LLM."""
-        lines = []
+    def find_number_in_dataframe(
+        self, number: float, tolerance: float = 0.01
+    ) -> List[Dict]:
+        """
+        Search for a numeric value across ALL numeric columns.
+        """
+        findings = []
 
-        # Date columns
-        date_cols = self.get_date_columns()
-        if date_cols:
-            lines.append(f"DATE COLUMNS: {date_cols}")
+        for col in self.columns:
+            profile = self.column_profiles[col]
 
-        # Categorical columns with their possible values
-        cat_cols = self.get_categorical_columns()
-        if cat_cols:
-            lines.append("CATEGORICAL COLUMNS (filter-friendly):")
-            for col in cat_cols:
-                values = self.column_profiles[col]["sample_values"][:10]
-                lines.append(f"  - {col}: {values}")
+            if profile["type"] != "numeric":
+                continue
 
-        # Identifier/name columns
-        id_cols = self.get_identifier_columns()
-        if id_cols:
-            lines.append(
-                f"IDENTIFIER COLUMNS (names, IDs - high uniqueness): {id_cols}"
-            )
+            try:
+                series = self.df[col]
+                mask = (series - number).abs() <= tolerance
+
+                if mask.sum() > 0:
+                    findings.append(
+                        {
+                            "column": col,
+                            "match_count": int(mask.sum()),
+                            "selectivity": mask.sum() / len(self.df),
+                            "mask": mask,
+                        }
+                    )
+            except Exception:
+                continue
+
+        # Sort by selectivity
+        findings.sort(key=lambda x: x["selectivity"])
+
+        return findings
+
+    def find_date_in_dataframe(self, target_date) -> List[Dict]:
+        """
+        Search for a date across ALL date columns.
+        target_date should be a datetime.date object.
+        """
+        findings = []
+
+        for col in self.columns:
+            profile = self.column_profiles[col]
+
+            if profile["type"] != "datetime":
+                continue
+
+            try:
+                # Parse the column
+                parsed = pd.to_datetime(
+                    self.df[col], format=EXCEL_DATE_FORMAT, errors="coerce"
+                )
+
+                # Compare dates
+                mask = parsed.dt.date == target_date
+
+                if mask.sum() > 0:
+                    findings.append(
+                        {
+                            "column": col,
+                            "match_count": int(mask.sum()),
+                            "selectivity": mask.sum() / len(self.df),
+                            "mask": mask,
+                        }
+                    )
+            except Exception as e:
+                logger.debug(f"Date search error on column {col}: {e}")
+                continue
+
+        findings.sort(key=lambda x: x["selectivity"])
+
+        return findings
+
+    def get_data_summary_for_llm(self) -> str:
+        """
+        Generate a comprehensive summary of the data for the LLM.
+        All information comes from actual data analysis.
+        """
+        lines = [
+            "=== DATA STRUCTURE ===",
+            f"Total Rows: {len(self.df)}",
+            f"Columns: {len(self.columns)}",
+            "",
+        ]
+
+        for col, profile in self.column_profiles.items():
+            line = f"[{col}] Type: {profile['type']}, Unique: {profile['unique_count']}"
+
+            if profile["type"] == "numeric":
+                line += f", Range: {profile.get('min')} to {profile.get('max')}"
+
+            if profile.get("unique_values"):
+                vals_preview = profile["unique_values"][:7]
+                line += f", Values: {vals_preview}"
+
+            if profile.get("sample_values") and not profile.get("unique_values"):
+                samples = profile["sample_values"][:5]
+                line += f", Samples: {samples}"
+
+            lines.append(line)
 
         return "\n".join(lines)
 
 
-def _dynamic_keyword_search(
-    df: pd.DataFrame, analyzer: DataFrameAnalyzer, keyword: str
-) -> pd.Series:
+def extract_query_components_with_llm(
+    query: str, engine: DynamicQueryEngine
+) -> Dict[str, Any]:
     """
-    Dynamically search for a keyword using data-driven logic.
-    No hardcoded terms - learns from the actual data.
+    Use LLM to understand the query in context of the actual data.
+    The LLM sees the real data structure and extracts components accordingly.
     """
-    if df.empty:
-        return pd.Series(False, index=df.index)
+    data_summary = engine.get_data_summary_for_llm()
 
-    keyword = str(keyword).lower().strip()
+    # Show sample rows
+    sample_data = engine.df.head(3).to_string(index=False)
 
-    # Step 1: Find where this keyword (or parts of it) appears in the data
-    search_results = analyzer.find_value_in_data(keyword)
+    prompt = f"""You are analyzing a user's question about data in an Excel file.
 
-    logger.info(f"Keyword '{keyword}' search results: {search_results}")
+USER QUESTION: "{query}"
 
-    # If exact/partial phrase found somewhere
-    if search_results:
-        # Prefer categorical columns (they're meant for filtering)
-        categorical_matches = [r for r in search_results if r["is_categorical"]]
+ACTUAL DATA STRUCTURE:
+{data_summary}
 
-        if categorical_matches:
-            # Use the best categorical column match
-            best = categorical_matches[0]
-            col = best["column"]
+SAMPLE DATA (first 3 rows):
+{sample_data}
 
-            logger.info(f"Using categorical column '{col}' for keyword search")
+YOUR TASK:
+Extract the components from the user's question that can be used to filter and query this specific data.
 
-            # Search in this specific column
-            mask = (
-                df[col]
-                .astype(str)
-                .str.lower()
-                .str.contains(re.escape(keyword), na=False)
-            )
-            if mask.any():
-                return mask
+Respond with a JSON object containing:
 
-        # If no categorical match, use the most selective match
-        selective_matches = [r for r in search_results if r["match_ratio"] < 0.5]
-        if selective_matches:
-            best = selective_matches[0]
-            col = best["column"]
+1. "search_terms": List of text values to search for (names, identifiers, categories mentioned in the question)
+   - Extract ANY word/phrase that might match data in text columns
+   - Look at the sample data and column values above to identify what the user might be referring to
 
-            logger.info(f"Using selective column '{col}' for keyword search")
+2. "date_value": A date mentioned in the question, converted to "YYYY-MM-DD" format, or null if no date
+   - Handle formats like "14th nov 2025", "november 14, 2025", etc.
 
-            mask = (
-                df[col]
-                .astype(str)
-                .str.lower()
-                .str.contains(re.escape(keyword), na=False)
-            )
-            if mask.any():
-                return mask
+3. "numeric_values": List of numbers mentioned (excluding years), or empty list
+   - Include amounts, quantities, prices, etc.
 
-    # Step 2: Token-based search with dynamic frequency analysis
-    tokens = [t for t in re.split(r"\W+", keyword) if len(t) >= 2]
+4. "target_attribute": The specific piece of information the user wants to know
+   - This should be a description like "payment method", "status", "total amount", etc.
+   - Or null if they want all information
 
-    if not tokens:
-        return pd.Series(False, index=df.index)
+5. "question_type": One of "specific_value", "count", "sum", "list", "filter_only"
+   - "specific_value": User wants one specific attribute (e.g., "what is the payment mode")
+   - "count": User wants a count (e.g., "how many orders")
+   - "sum": User wants a total (e.g., "total amount")
+   - "list": User wants to see matching records
+   - "filter_only": User just wants filtered data
 
-    # Analyze each token's frequency across ALL data
-    token_analysis = {}
-    all_text = df.astype(str).agg(" ".join, axis=1).str.lower()
+IMPORTANT:
+- Base your extraction on the ACTUAL column names and values shown above
+- The search_terms should be things that would actually appear in the data
+- Be precise - extract exactly what's in the question
 
-    for token in tokens:
-        try:
-            mask = all_text.str.contains(re.escape(token), na=False)
-            count = mask.sum()
-            ratio = count / len(df) if len(df) > 0 else 0
+Respond ONLY with valid JSON, no other text:
+"""
 
-            token_analysis[token] = {
-                "mask": mask,
-                "count": count,
-                "ratio": ratio,
-                "is_rare": ratio < 0.3,  # Appears in less than 30% of rows
-                "is_common": ratio > 0.7,  # Appears in more than 70% of rows
-                "is_universal": ratio > 0.9,  # Appears in almost all rows
-            }
-        except Exception as e:
-            logger.error(f"Token analysis error for '{token}': {e}")
-            continue
-
-    logger.info(
-        f"Token analysis: {[(t, a['ratio']) for t, a in token_analysis.items()]}"
-    )
-
-    # Prioritize rare tokens (they're the discriminators)
-    rare_tokens = [
-        t for t, a in token_analysis.items() if a["is_rare"] and a["count"] > 0
-    ]
-    moderate_tokens = [
-        t
-        for t, a in token_analysis.items()
-        if not a["is_rare"] and not a["is_universal"] and a["count"] > 0
-    ]
-
-    # Strategy: AND all rare tokens together
-    if rare_tokens:
-        mask = pd.Series(True, index=df.index)
-        for token in rare_tokens:
-            mask &= token_analysis[token]["mask"]
-
-        if mask.any():
-            logger.info(f"Rare token match ({rare_tokens}): {mask.sum()} rows")
-            return mask
-
-    # If no rare tokens, try moderate tokens
-    if moderate_tokens:
-        mask = pd.Series(True, index=df.index)
-        for token in moderate_tokens:
-            mask &= token_analysis[token]["mask"]
-
-        if mask.any():
-            logger.info(f"Moderate token match ({moderate_tokens}): {mask.sum()} rows")
-            return mask
-
-    # Last resort: OR any matching tokens
-    any_mask = pd.Series(False, index=df.index)
-    for token, analysis in token_analysis.items():
-        if analysis["count"] > 0 and not analysis["is_universal"]:
-            any_mask |= analysis["mask"]
-
-    if any_mask.any():
-        logger.info(f"Fallback OR match: {any_mask.sum()} rows")
-        return any_mask
-
-    return pd.Series(False, index=df.index)
-
-
-def smart_filter(
-    df: pd.DataFrame,
-    analyzer: DataFrameAnalyzer = None,
-    date_str: str = None,
-    start_date_str: str = None,
-    end_date_str: str = None,
-    keyword: str = None,
-) -> pd.DataFrame:
-    """
-    Universal smart filter that works with ANY Excel structure.
-
-    Args:
-        df: The dataframe to filter
-        analyzer: Pre-computed DataFrameAnalyzer (created if not provided)
-        date_str: SINGLE date to filter by (e.g. '21 Nov 2025')
-        start_date_str: Start of date range (inclusive)
-        end_date_str: End of date range (inclusive)
-        keyword: Keyword/phrase to filter by
-    """
-    if analyzer is None:
-        analyzer = DataFrameAnalyzer(df)
-
-    filtered_df = df.copy()
-
-    # ---------- DATE FILTERING (single date OR range) ----------
-    def _parse_date(s: str):
-        if not s:
-            return None
-        s = str(s).strip()
-        # Try flexible parsing first (handles '21 Nov 2025', '2025-11-21', etc.)
-        try:
-            return pd.to_datetime(s, dayfirst=True).date()
-        except Exception:
-            # Try a few explicit formats as fallback
-            for fmt in [
-                "%Y-%m-%d",
-                "%d-%m-%Y",
-                "%m-%d-%Y",
-                "%d/%m/%Y",
-                "%m/%d/%Y",
-                "%d %b %Y",
-                "%d %B %Y",
-            ]:
-                try:
-                    return pd.to_datetime(s, format=fmt).date()
-                except Exception:
-                    continue
-        return None
-
-    single_date = _parse_date(date_str) if date_str else None
-    start_date = _parse_date(start_date_str) if start_date_str else None
-    end_date = _parse_date(end_date_str) if end_date_str else None
-
-    if single_date or start_date or end_date:
-        date_found = False
-        date_columns = analyzer.get_date_columns()
-        candidate_cols = date_columns + [c for c in df.columns if c not in date_columns]
-
-        for col in candidate_cols:
-            try:
-                series = df[col]
-
-                # Your file's datetime format: MM/DD/YYYY HH:MM:SS
-                try:
-                    temp_series = pd.to_datetime(
-                        series,
-                        format="%m/%d/%Y %H:%M:%S",
-                        errors="coerce",
-                    )
-                except Exception:
-                    temp_series = pd.to_datetime(series, errors="coerce")
-
-                if temp_series.notna().sum() == 0:
-                    continue
-
-                s_dates = temp_series.dt.date
-
-                if single_date:
-                    mask = s_dates == single_date
-                else:
-                    mask = pd.Series(True, index=df.index)
-                    if start_date:
-                        mask &= s_dates >= start_date
-                    if end_date:
-                        mask &= s_dates <= end_date
-
-                if mask.any():
-                    filtered_df = df[mask]
-                    date_found = True
-                    logger.info(
-                        "Date filter on column '%s': rows=%d, single_date=%r, start_date=%r, end_date=%r",
-                        col,
-                        mask.sum(),
-                        single_date,
-                        start_date,
-                        end_date,
-                    )
-                    break
-            except Exception as e:
-                logger.error(f"Date filter error on column '{col}': {e}")
-                continue
-
-        if not date_found:
-            logger.info(
-                "No rows found for date/date range: single=%r, start=%r, end=%r",
-                single_date,
-                start_date,
-                end_date,
-            )
-            return pd.DataFrame()
-
-    # ---------- KEYWORD FILTERING (unchanged logic) ----------
-    if keyword:
-        keyword = str(keyword).strip()
-        if not keyword:
-            return filtered_df
-
-        # Rebuild analyzer on the already date-filtered data if we did a date filter
-        did_date_filter = bool(single_date or start_date or end_date)
-        current_analyzer = (
-            DataFrameAnalyzer(filtered_df) if did_date_filter else analyzer
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You extract query components from natural language questions. Respond only with valid JSON.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
         )
 
-        mask = _dynamic_keyword_search(filtered_df, current_analyzer, keyword)
+        response_text = response.choices[0].message.content.strip()
 
-        if mask.any():
-            before = len(filtered_df)
-            filtered_df = filtered_df[mask]
-            logger.info(
-                "Keyword filter '%s': %d -> %d rows",
-                keyword,
-                before,
-                len(filtered_df),
-            )
-        else:
-            if did_date_filter and len(filtered_df) > 0:
-                logger.warning(
-                    "Keyword '%s' not found after date filter, returning date-only results",
-                    keyword,
+        # Clean markdown if present
+        if "```" in response_text:
+            response_text = re.sub(r"```json?\s*", "", response_text)
+            response_text = re.sub(r"```\s*$", "", response_text)
+
+        import json
+
+        parsed = json.loads(response_text)
+
+        logger.info(f"LLM extracted components: {parsed}")
+        return parsed
+
+    except Exception as e:
+        logger.error(f"LLM extraction failed: {e}")
+        return {
+            "search_terms": [],
+            "date_value": None,
+            "numeric_values": [],
+            "target_attribute": None,
+            "question_type": "list",
+        }
+
+
+def find_target_column_with_llm(
+    query: str, target_description: str, engine: DynamicQueryEngine
+) -> Optional[str]:
+    """
+    Use LLM to identify which column contains the target attribute.
+    """
+    if not target_description:
+        return None
+
+    columns_info = []
+    for col, profile in engine.column_profiles.items():
+        info = f"- {col}: {profile['type']}"
+        if profile.get("unique_values"):
+            info += f", values like: {profile['unique_values'][:5]}"
+        elif profile.get("sample_values"):
+            info += f", samples: {profile['sample_values'][:3]}"
+        columns_info.append(info)
+
+    prompt = f"""Given this user question and target attribute, identify the exact column name that contains the answer.
+
+USER QUESTION: "{query}"
+TARGET ATTRIBUTE: "{target_description}"
+
+AVAILABLE COLUMNS:
+{chr(10).join(columns_info)}
+
+Which column name contains the "{target_description}"?
+Respond with ONLY the exact column name from the list above, or "NONE" if no column matches.
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You identify column names. Respond with only the column name or NONE.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+
+        result = response.choices[0].message.content.strip()
+
+        # Verify the column exists
+        if result in engine.columns:
+            return result
+
+        # Try case-insensitive match
+        for col in engine.columns:
+            if col.lower() == result.lower():
+                return col
+
+        return None
+
+    except Exception as e:
+        logger.error(f"Target column identification failed: {e}")
+        return None
+
+
+def execute_dynamic_query(
+    engine: DynamicQueryEngine, components: Dict[str, Any], query: str
+) -> Dict[str, Any]:
+    """
+    Execute the query using extracted components.
+    All filtering is data-driven based on where values are actually found.
+    """
+    result = {
+        "success": False,
+        "answer": "NO_MATCH",
+        "debug": {
+            "components": components,
+            "filters_applied": [],
+            "rows_progression": [len(engine.df)],
+        },
+    }
+
+    current_df = engine.df.copy()
+    combined_mask = pd.Series(True, index=engine.df.index)
+
+    # 1. Apply text search filters
+    search_terms = components.get("search_terms", [])
+    for term in search_terms:
+        if not term or len(str(term).strip()) < 2:
+            continue
+
+        findings = engine.find_value_in_dataframe(str(term))
+
+        if findings:
+            # Use the most selective column (first in sorted list)
+            best_finding = findings[0]
+
+            # Only apply if it's selective enough (not matching everything)
+            if best_finding["selectivity"] < 0.8:
+                combined_mask &= best_finding["mask"]
+                result["debug"]["filters_applied"].append(
+                    {
+                        "type": "text_search",
+                        "term": term,
+                        "column": best_finding["column"],
+                        "matches": best_finding["contains_matches"],
+                        "selectivity": best_finding["selectivity"],
+                    }
                 )
-            else:
-                logger.info("Keyword '%s' not found anywhere", keyword)
-                return pd.DataFrame()
 
-    return filtered_df
+                temp_count = combined_mask.sum()
+                result["debug"]["rows_progression"].append(int(temp_count))
+
+                logger.info(
+                    f"Text filter '{term}' on column '{best_finding['column']}': "
+                    f"{best_finding['contains_matches']} matches, {temp_count} remaining"
+                )
+
+                if temp_count == 0:
+                    logger.warning(f"Filter '{term}' eliminated all rows, reverting")
+                    combined_mask |= best_finding["mask"]  # Revert by OR-ing back
+
+    # 2. Apply date filter
+    date_value = components.get("date_value")
+    if date_value:
+        try:
+            target_date = pd.to_datetime(date_value).date()
+            date_findings = engine.find_date_in_dataframe(target_date)
+
+            if date_findings:
+                best_date = date_findings[0]
+
+                # Apply date filter
+                new_mask = combined_mask & best_date["mask"]
+
+                if new_mask.sum() > 0:
+                    combined_mask = new_mask
+                    result["debug"]["filters_applied"].append(
+                        {
+                            "type": "date_filter",
+                            "date": date_value,
+                            "column": best_date["column"],
+                            "matches": best_date["match_count"],
+                        }
+                    )
+                    result["debug"]["rows_progression"].append(int(combined_mask.sum()))
+
+                    logger.info(
+                        f"Date filter '{date_value}' on column '{best_date['column']}': "
+                        f"{combined_mask.sum()} remaining"
+                    )
+                else:
+                    logger.warning(f"Date filter would eliminate all rows, skipping")
+
+        except Exception as e:
+            logger.error(f"Date parsing error: {e}")
+
+    # 3. Apply numeric filter (for verification/refinement)
+    numeric_values = components.get("numeric_values", [])
+    if numeric_values and combined_mask.sum() > 1:  # Only if multiple rows remain
+        for num in numeric_values:
+            try:
+                num_findings = engine.find_number_in_dataframe(float(num))
+
+                if num_findings:
+                    best_num = num_findings[0]
+
+                    # Only apply if selective
+                    if best_num["selectivity"] < 0.5:
+                        new_mask = combined_mask & best_num["mask"]
+
+                        if new_mask.sum() > 0:
+                            combined_mask = new_mask
+                            result["debug"]["filters_applied"].append(
+                                {
+                                    "type": "numeric_filter",
+                                    "value": num,
+                                    "column": best_num["column"],
+                                    "matches": best_num["match_count"],
+                                }
+                            )
+                            result["debug"]["rows_progression"].append(
+                                int(combined_mask.sum())
+                            )
+
+                            logger.info(
+                                f"Numeric filter '{num}' on column '{best_num['column']}': "
+                                f"{combined_mask.sum()} remaining"
+                            )
+
+            except Exception as e:
+                logger.debug(f"Numeric filter error: {e}")
+
+    # 4. Get filtered dataframe
+    filtered_df = engine.df[combined_mask]
+    result["debug"]["final_row_count"] = len(filtered_df)
+
+    if filtered_df.empty:
+        result["answer"] = "NO_MATCH"
+        return result
+
+    # 5. Extract the target attribute
+    target_description = components.get("target_attribute")
+    question_type = components.get("question_type", "list")
+
+    if question_type == "count":
+        result["answer"] = str(len(filtered_df))
+        result["success"] = True
+        return result
+
+    if question_type == "sum" and target_description:
+        # Find numeric column matching the description
+        target_col = find_target_column_with_llm(query, target_description, engine)
+        if target_col and engine.column_profiles[target_col]["type"] == "numeric":
+            total = filtered_df[target_col].sum()
+            result["answer"] = str(total)
+            result["success"] = True
+            return result
+
+    if target_description:
+        target_col = find_target_column_with_llm(query, target_description, engine)
+        result["debug"]["target_column"] = target_col
+
+        if target_col and target_col in filtered_df.columns:
+            values = filtered_df[target_col].dropna().unique()
+
+            if len(values) == 1:
+                result["answer"] = str(values[0])
+                result["success"] = True
+            elif len(values) > 1:
+                result["answer"] = (
+                    f"Multiple values found: {', '.join(str(v) for v in values[:10])}"
+                )
+                result["success"] = True
+            else:
+                result["answer"] = "No value found in the matching row(s)"
+
+            return result
+
+    # 6. Default: return filtered data
+    if len(filtered_df) <= 10:
+        result["answer"] = filtered_df.to_string(index=False)
+    else:
+        result["answer"] = (
+            f"Found {len(filtered_df)} matching rows:\n\n{filtered_df.head(10).to_string(index=False)}"
+        )
+
+    result["success"] = True
+    return result
 
 
 def execute_pandas_retrieval(file_name: str, query: str) -> str:
     """
-    Execute pandas-based retrieval for Excel files.
-    Fully dynamic - no hardcoded column names or values.
+    Main entry point for dynamic pandas-based data retrieval.
     """
     file_path = os.path.join(UPLOADS_DIR, file_name)
 
@@ -490,136 +600,82 @@ def execute_pandas_retrieval(file_name: str, query: str) -> str:
         return "Error: Source file not found."
 
     try:
-        # Load the Excel file
+        # Load Excel file
         df = pd.read_excel(file_path, header=0)
         df.columns = [str(col).strip() for col in df.columns]
 
-        # Analyze the dataframe structure
-        analyzer = DataFrameAnalyzer(df)
+        logger.info(f"Loaded file: {file_name}")
+        logger.info(f"Shape: {df.shape}")
+        logger.info(f"Columns: {list(df.columns)}")
 
-        # Generate dynamic context for LLM
-        column_summary = analyzer.get_column_summary()
-        sample_data = df.head(5).to_string(index=False)
-        columns = list(df.columns)
+        # Initialize dynamic query engine
+        engine = DynamicQueryEngine(df)
 
-        # Get categorical values for context
-        categorical_values = analyzer.get_all_categorical_values()
-        cat_context = ""
-        if categorical_values:
-            cat_lines = []
-            for col, vals in categorical_values.items():
-                cat_lines.append(f"  {col}: {vals}")
-            cat_context = "KNOWN VALUES IN DATA:\n" + "\n".join(cat_lines)
+        # Log discovered column types
+        for col, profile in engine.column_profiles.items():
+            logger.info(
+                f"Column '{col}': type={profile['type']}, unique={profile['unique_count']}"
+            )
 
-        prompt = f"""
-You are a STRICT Python code generator for pandas-style data analysis.
+        # Step 1: Extract query components using LLM (with data context)
+        components = extract_query_components_with_llm(query, engine)
 
-CONTEXT
-- A pandas DataFrame `df` is ALREADY loaded.
-- A DataFrameAnalyzer `analyzer` is ALREADY created for `df`.
-- You MUST NOT import anything.
-- You MUST NOT read files.
-- You MUST NOT print anything.
+        # Step 2: Execute the query dynamically
+        result = execute_dynamic_query(engine, components, query)
 
-AVAILABLE:
-- `df` - the loaded DataFrame
-- `analyzer` - DataFrameAnalyzer instance
-- `smart_filter(df, analyzer, date_str=None, start_date_str=None, end_date_str=None, keyword=None)` - filtering helper (supports single date or date ranges)
+        logger.info(f"Query result: success={result['success']}")
+        logger.info(f"Debug info: {result['debug']}")
 
-=== DATAFRAME STRUCTURE ===
-Columns: {columns}
+        # Step 3: If failed, try alternative approach
+        if not result["success"] or result["answer"] == "NO_MATCH":
+            logger.info(
+                "Primary approach failed, trying direct LLM query generation..."
+            )
+            alternative_result = _direct_llm_query(df, engine, query)
+            if alternative_result and alternative_result != "NO_MATCH":
+                return alternative_result
 
-{column_summary}
+        return result["answer"]
 
-{cat_context}
+    except Exception as e:
+        logger.error(f"Error: {traceback.format_exc()}")
+        return f"Error: {str(e)}"
 
-=== SAMPLE DATA ===
-{sample_data}
 
-=== USER QUERY ===
-{query!r}
+def _direct_llm_query(df: pd.DataFrame, engine: DynamicQueryEngine, query: str) -> str:
+    """
+    Fallback: Let LLM generate specific filter conditions based on actual data.
+    """
+    try:
+        # Show the LLM actual data samples
+        data_summary = engine.get_data_summary_for_llm()
+        sample_rows = df.head(5).to_string(index=False)
 
-YOUR TASK
-Generate Python code that:
+        prompt = f"""Analyze this question and the actual data to find the answer.
 
-1. **Extract parameters from the query:**
-   
-   `date_str`: Use this ONLY when the question clearly refers to a SINGLE specific date
-   (e.g. "on 21 Nov 2025"). Example:
-   - "on nov 21, 2025" → date_str = "nov 21, 2025", start_date_str = None, end_date_str = None
+QUESTION: "{query}"
 
-   `start_date_str` and `end_date_str`: Use these when the question describes a DATE RANGE
-   (e.g. "from X to Y", "between X and Y", "from X until Y").
-   Examples:
-   - "from 21 to 23 nov 2025" → start_date_str = "21 nov 2025", end_date_str = "23 nov 2025", date_str = None
-   - "between nov 21, 2025 and nov 23, 2025" → start_date_str = "nov 21, 2025", end_date_str = "nov 23, 2025", date_str = None
-   - "after nov 21, 2025" → start_date_str = "nov 21, 2025", end_date_str = None, date_str = None
-   - "before nov 23, 2025" → start_date_str = None, end_date_str = "nov 23, 2025", date_str = None
+DATA STRUCTURE:
+{data_summary}
 
-   IMPORTANT:
-   - Never put more than one date into `date_str`.
-   - If a range is present, set `date_str = None` and use `start_date_str` / `end_date_str`.
+SAMPLE DATA:
+{sample_rows}
 
-   `keyword`: Extract the SPECIFIC identifying phrase the user wants to filter by.
-   - Look at the KNOWN VALUES above to understand what values exist
-   - Keep qualifier words that distinguish items (e.g., "premium ironing", "type B")
-   - If no specific filter needed → keyword = None
+Based on the actual data shown above:
 
-2. **Filter the data:**
-   result_df = smart_filter(
-       df,
-       analyzer,
-       date_str=date_str,
-       start_date_str=start_date_str,
-       end_date_str=end_date_str,
-       keyword=keyword,
-   )
+1. Identify which column(s) need to be filtered and with what values
+2. Identify which column contains the answer
 
-3. **Generate result based on question_type:**
+Respond with JSON:
+{{
+    "filters": [
+        {{"column": "exact_column_name_from_data", "value": "exact_value_to_search", "match_type": "exact|contains"}}
+    ],
+    "answer_column": "exact_column_name_containing_answer",
+    "reasoning": "brief explanation"
+}}
 
-   If question_type in ["who", "name"]:
-       # Find columns with high uniqueness (likely names/identifiers)
-       id_cols = analyzer.get_identifier_columns()
-       if len(result_df) == 0:
-           result = "NO_MATCH"
-       elif id_cols:
-           result = result_df[id_cols].drop_duplicates().to_string(index=False)
-       else:
-           result = result_df.to_string(index=False)
-   
-   elif question_type == "count":
-       result = str(len(result_df))
-   
-   elif question_type in ["sum", "total"]:
-       # Find numeric columns and sum them
-       numeric_cols = result_df.select_dtypes(include=['number']).columns.tolist()
-       if numeric_cols and len(result_df) > 0:
-           sums = result_df[numeric_cols].sum().to_dict()
-           result = str(sums)
-       else:
-           result = str(len(result_df))
-   
-   elif question_type in ["average", "mean"]:
-       numeric_cols = result_df.select_dtypes(include=['number']).columns.tolist()
-       if numeric_cols and len(result_df) > 0:
-           means = result_df[numeric_cols].mean().to_dict()
-           result = str(means)
-       else:
-           result = "NO_NUMERIC_DATA"
-   
-   else:
-       result = result_df.to_string(index=False) if len(result_df) > 0 else "NO_MATCH"
-
-4. **Required variables at end:**
-   - date_str (str or None)
-   - start_date_str (str or None)
-   - end_date_str (str or None)
-   - keyword (str or None)
-   - question_type (str)
-   - result_df (DataFrame)
-   - result (str)
-
-OUTPUT: Only executable Python code. No comments. No backticks.
+Use EXACT column names and realistic values based on the data shown.
 """
 
         response = client.chat.completions.create(
@@ -627,49 +683,106 @@ OUTPUT: Only executable Python code. No comments. No backticks.
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a Python code generator. Output ONLY executable Python code.",
+                    "content": "You analyze data and extract filter conditions. Respond only with JSON.",
                 },
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
         )
 
-        code = (
-            response.choices[0]
-            .message.content.replace("```python", "")
-            .replace("```", "")
-            .strip()
-        )
+        response_text = response.choices[0].message.content.strip()
 
-        logger.info(f"Generated Pandas Code:\n{code}")
-        logger.info(f"User query: {query}")
+        if "```" in response_text:
+            response_text = re.sub(r"```json?\s*", "", response_text)
+            response_text = re.sub(r"```\s*$", "", response_text)
 
-        # Execute with all necessary context
-        local_vars = {
-            "df": df,
-            "pd": pd,
-            "analyzer": analyzer,
-            "smart_filter": smart_filter,
-        }
+        import json
 
-        try:
-            exec(code, {}, local_vars)
-        except Exception as exec_err:
-            logger.error(f"CODE EXECUTION ERROR:\n{code}\nERROR: {exec_err}")
-            return f"Error executing code: {exec_err}"
+        parsed = json.loads(response_text)
 
-        # Log what was extracted
-        logger.info(
-            "Execution params: date_str=%r, keyword=%r, question_type=%r, result_rows=%d",
-            local_vars.get("date_str"),
-            local_vars.get("keyword"),
-            local_vars.get("question_type"),
-            len(local_vars.get("result_df", [])),
-        )
+        logger.info(f"Direct LLM query plan: {parsed}")
 
-        raw_result = local_vars.get("result", "No result variable returned.")
-        return str(raw_result)
+        # Apply filters
+        filtered_df = df.copy()
+
+        for f in parsed.get("filters", []):
+            col = f.get("column")
+            val = f.get("value")
+            match_type = f.get("match_type", "contains")
+
+            if col not in filtered_df.columns:
+                logger.warning(f"Column '{col}' not found")
+                continue
+
+            col_profile = engine.column_profiles.get(col, {})
+
+            # Handle date columns
+            if col_profile.get("type") == "datetime":
+                try:
+                    parsed_col = pd.to_datetime(
+                        filtered_df[col], format=EXCEL_DATE_FORMAT, errors="coerce"
+                    )
+                    target_date = pd.to_datetime(val).date()
+                    mask = parsed_col.dt.date == target_date
+                    new_df = filtered_df[mask]
+                    if len(new_df) > 0:
+                        filtered_df = new_df
+                        logger.info(f"Date filter on '{col}': {len(filtered_df)} rows")
+                except Exception as e:
+                    logger.error(f"Date filter error: {e}")
+
+            # Handle numeric columns
+            elif col_profile.get("type") == "numeric":
+                try:
+                    num_val = float(val)
+                    mask = (filtered_df[col] - num_val).abs() < 0.01
+                    new_df = filtered_df[mask]
+                    if len(new_df) > 0:
+                        filtered_df = new_df
+                        logger.info(
+                            f"Numeric filter on '{col}': {len(filtered_df)} rows"
+                        )
+                except Exception as e:
+                    logger.error(f"Numeric filter error: {e}")
+
+            # Handle text columns
+            else:
+                val_lower = str(val).lower()
+                if match_type == "exact":
+                    mask = filtered_df[col].astype(str).str.lower() == val_lower
+                else:
+                    mask = (
+                        filtered_df[col]
+                        .astype(str)
+                        .str.lower()
+                        .str.contains(re.escape(val_lower), na=False)
+                    )
+
+                new_df = filtered_df[mask]
+                if len(new_df) > 0:
+                    filtered_df = new_df
+                    logger.info(
+                        f"Text filter on '{col}' with '{val}': {len(filtered_df)} rows"
+                    )
+
+        if filtered_df.empty:
+            return "NO_MATCH"
+
+        # Extract answer
+        answer_col = parsed.get("answer_column")
+        if answer_col and answer_col in filtered_df.columns:
+            values = filtered_df[answer_col].dropna().unique()
+            if len(values) == 1:
+                return str(values[0])
+            elif len(values) > 1:
+                return f"Multiple values: {', '.join(str(v) for v in values[:10])}"
+
+        # Return data if no specific answer column
+        if len(filtered_df) <= 10:
+            return filtered_df.to_string(index=False)
+
+        return f"Found {len(filtered_df)} rows:\n{filtered_df.head(10).to_string(index=False)}"
 
     except Exception as e:
-        logger.error(f"System Error: {traceback.format_exc()}")
-        return f"System Error: {str(e)}"
+        logger.error(f"Direct LLM query failed: {e}")
+        return "NO_MATCH"
