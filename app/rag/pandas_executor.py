@@ -336,6 +336,8 @@ def smart_filter(
     df: pd.DataFrame,
     analyzer: DataFrameAnalyzer = None,
     date_str: str = None,
+    start_date_str: str = None,
+    end_date_str: str = None,
     keyword: str = None,
 ) -> pd.DataFrame:
     """
@@ -344,7 +346,9 @@ def smart_filter(
     Args:
         df: The dataframe to filter
         analyzer: Pre-computed DataFrameAnalyzer (created if not provided)
-        date_str: Date string to filter by
+        date_str: SINGLE date to filter by (e.g. '21 Nov 2025')
+        start_date_str: Start of date range (inclusive)
+        end_date_str: End of date range (inclusive)
         keyword: Keyword/phrase to filter by
     """
     if analyzer is None:
@@ -352,83 +356,124 @@ def smart_filter(
 
     filtered_df = df.copy()
 
-    # --- 1. HANDLE DATE FILTERING ---
-    if date_str:
+    # ---------- DATE FILTERING (single date OR range) ----------
+    def _parse_date(s: str):
+        if not s:
+            return None
+        s = str(s).strip()
+        # Try flexible parsing first (handles '21 Nov 2025', '2025-11-21', etc.)
         try:
-            target_date = pd.to_datetime(date_str, dayfirst=True).date()
-        except Exception as e:
-            logger.error(f"Date parse error for '{date_str}': {e}")
-            # Try alternative formats
-            for fmt in ["%Y-%m-%d", "%d-%m-%Y", "%m-%d-%Y", "%d/%m/%Y", "%m/%d/%Y"]:
+            return pd.to_datetime(s, dayfirst=True).date()
+        except Exception:
+            # Try a few explicit formats as fallback
+            for fmt in [
+                "%Y-%m-%d",
+                "%d-%m-%Y",
+                "%m-%d-%Y",
+                "%d/%m/%Y",
+                "%m/%d/%Y",
+                "%d %b %Y",
+                "%d %B %Y",
+            ]:
                 try:
-                    target_date = pd.to_datetime(date_str, format=fmt).date()
-                    break
+                    return pd.to_datetime(s, format=fmt).date()
                 except Exception:
                     continue
-            else:
-                return pd.DataFrame()
+        return None
 
+    single_date = _parse_date(date_str) if date_str else None
+    start_date = _parse_date(start_date_str) if start_date_str else None
+    end_date = _parse_date(end_date_str) if end_date_str else None
+
+    if single_date or start_date or end_date:
         date_found = False
         date_columns = analyzer.get_date_columns()
-
-        # Try identified date columns first, then all columns
         candidate_cols = date_columns + [c for c in df.columns if c not in date_columns]
 
         for col in candidate_cols:
             try:
                 series = df[col]
 
-                if pd.api.types.is_datetime64_any_dtype(series):
-                    temp_series = series
-                else:
-                    temp_series = pd.to_datetime(series, errors="coerce", dayfirst=True)
+                # Your file's datetime format: MM/DD/YYYY HH:MM:SS
+                try:
+                    temp_series = pd.to_datetime(
+                        series,
+                        format="%m/%d/%Y %H:%M:%S",
+                        errors="coerce",
+                    )
+                except Exception:
+                    temp_series = pd.to_datetime(series, errors="coerce")
 
                 if temp_series.notna().sum() == 0:
                     continue
 
-                mask = temp_series.dt.date == target_date
+                s_dates = temp_series.dt.date
+
+                if single_date:
+                    mask = s_dates == single_date
+                else:
+                    mask = pd.Series(True, index=df.index)
+                    if start_date:
+                        mask &= s_dates >= start_date
+                    if end_date:
+                        mask &= s_dates <= end_date
+
                 if mask.any():
                     filtered_df = df[mask]
                     date_found = True
                     logger.info(
-                        f"Date filter: {target_date} in '{col}' -> {mask.sum()} rows"
+                        "Date filter on column '%s': rows=%d, single_date=%r, start_date=%r, end_date=%r",
+                        col,
+                        mask.sum(),
+                        single_date,
+                        start_date,
+                        end_date,
                     )
                     break
-            except Exception:
+            except Exception as e:
+                logger.error(f"Date filter error on column '{col}': {e}")
                 continue
 
         if not date_found:
-            logger.info(f"No rows found for date {target_date}")
+            logger.info(
+                "No rows found for date/date range: single=%r, start=%r, end=%r",
+                single_date,
+                start_date,
+                end_date,
+            )
             return pd.DataFrame()
 
-    # --- 2. HANDLE KEYWORD FILTERING ---
+    # ---------- KEYWORD FILTERING (unchanged logic) ----------
     if keyword:
         keyword = str(keyword).strip()
-
         if not keyword:
             return filtered_df
 
-        # Create analyzer for filtered data if we filtered by date
-        current_analyzer = DataFrameAnalyzer(filtered_df) if date_str else analyzer
+        # Rebuild analyzer on the already date-filtered data if we did a date filter
+        did_date_filter = bool(single_date or start_date or end_date)
+        current_analyzer = (
+            DataFrameAnalyzer(filtered_df) if did_date_filter else analyzer
+        )
 
-        # Use dynamic keyword search
         mask = _dynamic_keyword_search(filtered_df, current_analyzer, keyword)
 
         if mask.any():
             before = len(filtered_df)
             filtered_df = filtered_df[mask]
             logger.info(
-                f"Keyword filter '{keyword}': {before} -> {len(filtered_df)} rows"
+                "Keyword filter '%s': %d -> %d rows",
+                keyword,
+                before,
+                len(filtered_df),
             )
         else:
-            # Keyword not found
-            if date_str and len(filtered_df) > 0:
-                # Return date-filtered results with a warning
+            if did_date_filter and len(filtered_df) > 0:
                 logger.warning(
-                    f"Keyword '{keyword}' not found, returning date-only results"
+                    "Keyword '%s' not found after date filter, returning date-only results",
+                    keyword,
                 )
             else:
-                logger.info(f"Keyword '{keyword}' not found anywhere")
+                logger.info("Keyword '%s' not found anywhere", keyword)
                 return pd.DataFrame()
 
     return filtered_df
@@ -479,7 +524,7 @@ CONTEXT
 AVAILABLE:
 - `df` - the loaded DataFrame
 - `analyzer` - DataFrameAnalyzer instance
-- `smart_filter(df, analyzer, date_str=None, keyword=None)` - filtering helper
+- `smart_filter(df, analyzer, date_str=None, start_date_str=None, end_date_str=None, keyword=None)` - filtering helper (supports single date or date ranges)
 
 === DATAFRAME STRUCTURE ===
 Columns: {columns}
@@ -499,30 +544,36 @@ Generate Python code that:
 
 1. **Extract parameters from the query:**
    
-   `date_str`: Extract any date mentioned. Examples:
-   - "on nov 21, 2025" → date_str = "nov 21, 2025"
-   - "yesterday" → date_str = None (can't resolve)
-   - No date mentioned → date_str = None
-   
+   `date_str`: Use this ONLY when the question clearly refers to a SINGLE specific date
+   (e.g. "on 21 Nov 2025"). Example:
+   - "on nov 21, 2025" → date_str = "nov 21, 2025", start_date_str = None, end_date_str = None
+
+   `start_date_str` and `end_date_str`: Use these when the question describes a DATE RANGE
+   (e.g. "from X to Y", "between X and Y", "from X until Y").
+   Examples:
+   - "from 21 to 23 nov 2025" → start_date_str = "21 nov 2025", end_date_str = "23 nov 2025", date_str = None
+   - "between nov 21, 2025 and nov 23, 2025" → start_date_str = "nov 21, 2025", end_date_str = "nov 23, 2025", date_str = None
+   - "after nov 21, 2025" → start_date_str = "nov 21, 2025", end_date_str = None, date_str = None
+   - "before nov 23, 2025" → start_date_str = None, end_date_str = "nov 23, 2025", date_str = None
+
+   IMPORTANT:
+   - Never put more than one date into `date_str`.
+   - If a range is present, set `date_str = None` and use `start_date_str` / `end_date_str`.
+
    `keyword`: Extract the SPECIFIC identifying phrase the user wants to filter by.
    - Look at the KNOWN VALUES above to understand what values exist
-   - Keep qualifier words that distinguish items (e.g., "premium", "express", "type A")
-   - Examples:
-     - "premium ironing service" → keyword = "premium ironing"
-     - "orders from shop ABC" → keyword = "ABC" 
-     - "type B products" → keyword = "type B"
+   - Keep qualifier words that distinguish items (e.g., "premium ironing", "type B")
    - If no specific filter needed → keyword = None
-   
-   `question_type`: What kind of answer is needed?
-   - "who"/"name" - asking for person/entity names
-   - "count" - asking for a number/count
-   - "list" - asking to show/list data
-   - "sum"/"total" - asking for a sum
-   - "average"/"mean" - asking for average
-   - "other" - general query
 
 2. **Filter the data:**
-   result_df = smart_filter(df, analyzer, date_str=date_str, keyword=keyword)
+   result_df = smart_filter(
+       df,
+       analyzer,
+       date_str=date_str,
+       start_date_str=start_date_str,
+       end_date_str=end_date_str,
+       keyword=keyword,
+   )
 
 3. **Generate result based on question_type:**
 
@@ -561,7 +612,9 @@ Generate Python code that:
 
 4. **Required variables at end:**
    - date_str (str or None)
-   - keyword (str or None)  
+   - start_date_str (str or None)
+   - end_date_str (str or None)
+   - keyword (str or None)
    - question_type (str)
    - result_df (DataFrame)
    - result (str)
