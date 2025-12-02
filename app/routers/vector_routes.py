@@ -506,6 +506,8 @@ async def ask_question(
                 candidates, key=lambda c: c.get("similarity") or 0, reverse=True
             )[:3]
 
+        # In vector_routes.py - Replace the EXCEL INTERCEPTOR section with this:
+
         # =========================================================================
         # EXCEL INTERCEPTOR
         # =========================================================================
@@ -518,51 +520,137 @@ async def ask_question(
         if is_excel:
             logger.info(f"Excel Detected ({file_name}). Switching to Pandas Executor.")
             try:
-                # 2. Execute Pandas to get the ACCURATE Result (Rows or Calculated Number)
-                # This calls the updated function we discussed
-                raw_data = execute_pandas_retrieval(file_name, q)
+                # 2. Execute Pandas to get structured result
+                pandas_result = execute_pandas_retrieval(file_name, q)
 
-                # 3. Generate a Precise Response (The "Second" OpenAI call)
-                # We update the prompt to handle specific calculated answers better.
-                nl_system_prompt = (
-                    "You are a data analyst assistant. "
-                    "I will provide a User Query and the 'Raw Execution Result' derived from running Python code on the Excel file. "
-                    "\n\nRULES:"
-                    "\n1. **Calculated Values**: If the result is a single number (count, sum, average), answer the user's question directly with that number in a sentence."
-                    "\n2. **Data Lists**: If the result is a table/list, format it as a clean Markdown Table."
-                    "\n3. **No Match**: If the raw result is exactly 'NO_MATCH' or an empty table/dataframe, clearly say there are no records matching the user query."
-                    "\n4. **Errors**: If the result mentions an error, politely explain that the data couldn't be calculated."
-                    "\n5. Do not hallucinate data not present in the 'Raw Execution Result'."
-                )
+                if pandas_result.get("success"):
+                    response_type = pandas_result.get("response_type")
 
-                nl_user_prompt = f"User Query: {q}\n\nRaw Execution Result:\n{raw_data}"
+                    # Handle TABLE responses - direct data, minimal LLM processing
+                    if response_type == "table":
+                        intro_message = pandas_result.get(
+                            "intro_message", "Here are the results:"
+                        )
+                        table_markdown = pandas_result.get("table_markdown", "")
+                        total_rows = pandas_result.get("total_rows", 0)
 
-                nl_response = client.chat.completions.create(
-                    model=CHAT_MODEL,
-                    messages=[
-                        {"role": "system", "content": nl_system_prompt},
-                        {"role": "user", "content": nl_user_prompt},
-                    ],
-                    temperature=0,
-                )
+                        # Combine intro with table - NO LLM processing of the data
+                        answer = f"{intro_message}\n\n{table_markdown}"
 
-                answer = nl_response.choices[0].message.content.strip()
+                        # Update memory
+                        background_tasks.add_task(
+                            update_memory, user_id, session_id, q, answer
+                        )
 
-                # 4. Return Early
-                background_tasks.add_task(update_memory, user_id, session_id, q, answer)
+                        return {
+                            "status_code": status.HTTP_200_OK,
+                            "answer": answer,
+                            "response_type": "table",
+                            "table_data": pandas_result.get("table_data"),
+                            "table_html": pandas_result.get("table_html"),
+                            "columns": pandas_result.get("columns"),
+                            "total_rows": total_rows,
+                            "brief_explanation": f"Retrieved {total_rows} records directly from Excel.",
+                            "sources": [
+                                {
+                                    "file_name": file_name,
+                                    "rank": 1,
+                                    "type": "pandas_table",
+                                }
+                            ],
+                            "query_used": q,
+                            "must_answer": True,
+                            "session_id": session_id,
+                            "session_created": session_created,
+                        }
 
-                return {
-                    "status_code": status.HTTP_200_OK,
-                    "answer": answer,
-                    "brief_explanation": "Calculated directly from the Excel file.",
-                    "sources": [
-                        {"file_name": file_name, "rank": 1, "type": "pandas_exact"}
-                    ],
-                    "query_used": q,
-                    "must_answer": True,
-                    "session_id": session_id,
-                    "session_created": session_created,
-                }
+                    # Handle COUNT/VALUE responses - simple answers
+                    elif response_type in ["count", "value"]:
+                        answer = pandas_result.get("answer", "")
+                        intro = pandas_result.get("intro_message", "")
+
+                        if intro:
+                            answer = intro
+
+                        background_tasks.add_task(
+                            update_memory, user_id, session_id, q, answer
+                        )
+
+                        return {
+                            "status_code": status.HTTP_200_OK,
+                            "answer": answer,
+                            "response_type": response_type,
+                            "brief_explanation": "Calculated directly from the Excel file.",
+                            "sources": [
+                                {
+                                    "file_name": file_name,
+                                    "rank": 1,
+                                    "type": "pandas_exact",
+                                }
+                            ],
+                            "query_used": q,
+                            "must_answer": True,
+                            "session_id": session_id,
+                            "session_created": session_created,
+                        }
+
+                # If pandas execution wasn't successful, try the old LLM approach
+                else:
+                    # Fall through to let the original LLM-based approach handle it
+                    logger.info(
+                        "Pandas returned unsuccessful result, trying LLM approach..."
+                    )
+
+                    raw_data = pandas_result.get("answer", "NO_MATCH")
+
+                    if raw_data and raw_data != "NO_MATCH":
+                        # Use the original LLM approach for formatting
+                        nl_system_prompt = (
+                            "You are a data analyst assistant. "
+                            "I will provide a User Query and the 'Raw Execution Result' derived from running Python code on the Excel file. "
+                            "\n\nRULES:"
+                            "\n1. **Calculated Values**: If the result is a single number (count, sum, average), answer the user's question directly with that number in a sentence."
+                            "\n2. **Data Lists**: If the result is a table/list, format it as a clean Markdown Table."
+                            "\n3. **No Match**: If the raw result is exactly 'NO_MATCH' or an empty table/dataframe, clearly say there are no records matching the user query."
+                            "\n4. **Errors**: If the result mentions an error, politely explain that the data couldn't be calculated."
+                            "\n5. Do not hallucinate data not present in the 'Raw Execution Result'."
+                        )
+
+                        nl_user_prompt = (
+                            f"User Query: {q}\n\nRaw Execution Result:\n{raw_data}"
+                        )
+
+                        nl_response = client.chat.completions.create(
+                            model=CHAT_MODEL,
+                            messages=[
+                                {"role": "system", "content": nl_system_prompt},
+                                {"role": "user", "content": nl_user_prompt},
+                            ],
+                            temperature=0,
+                        )
+
+                        answer = nl_response.choices[0].message.content.strip()
+
+                        background_tasks.add_task(
+                            update_memory, user_id, session_id, q, answer
+                        )
+
+                        return {
+                            "status_code": status.HTTP_200_OK,
+                            "answer": answer,
+                            "brief_explanation": "Processed from the Excel file.",
+                            "sources": [
+                                {
+                                    "file_name": file_name,
+                                    "rank": 1,
+                                    "type": "pandas_llm",
+                                }
+                            ],
+                            "query_used": q,
+                            "must_answer": True,
+                            "session_id": session_id,
+                            "session_created": session_created,
+                        }
 
             except Exception as pd_error:
                 logger.error(

@@ -6,11 +6,39 @@ import traceback
 from typing import Optional, List, Dict, Any, Tuple
 from app.core.openai_client import client, CHAT_MODEL
 from app.core.logger import logger
+import math
+import numpy as np
 
 UPLOADS_DIR = os.path.abspath("./uploads")
 
 # Your fixed Excel date format
 EXCEL_DATE_FORMAT = "%m/%d/%Y %H:%M:%S"
+
+
+class QueryResult:
+    """
+    Enhanced result class that distinguishes between different response types.
+    """
+
+    def __init__(self):
+        self.success: bool = False
+        self.response_type: str = "text"  # "text", "table", "count", "value"
+        self.intro_message: str = ""
+        self.raw_data: Optional[pd.DataFrame] = None
+        self.scalar_value: Optional[str] = None
+        self.debug: Dict[str, Any] = {}
+        self.total_rows: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "response_type": self.response_type,
+            "intro_message": self.intro_message,
+            "raw_data": self.raw_data,
+            "scalar_value": self.scalar_value,
+            "total_rows": self.total_rows,
+            "debug": self.debug,
+        }
 
 
 class DynamicQueryEngine:
@@ -132,14 +160,13 @@ class DynamicQueryEngine:
                         "column": col,
                         "exact_matches": int(exact_count),
                         "contains_matches": int(contains_count),
-                        "selectivity": contains_count
-                        / len(self.df),  # Lower = more selective
+                        "selectivity": contains_count / len(self.df),
                         "matched_values": [str(v) for v in matched_values],
                         "mask": contains_mask,
                     }
                 )
 
-        # Sort by selectivity (most selective first) - prefer columns where the term is rare
+        # Sort by selectivity (most selective first)
         findings.sort(key=lambda x: (x["selectivity"], -x["exact_matches"]))
 
         return findings
@@ -174,7 +201,6 @@ class DynamicQueryEngine:
             except Exception:
                 continue
 
-        # Sort by selectivity
         findings.sort(key=lambda x: x["selectivity"])
 
         return findings
@@ -182,7 +208,6 @@ class DynamicQueryEngine:
     def find_date_in_dataframe(self, target_date) -> List[Dict]:
         """
         Search for a date across ALL date columns.
-        target_date should be a datetime.date object.
         """
         findings = []
 
@@ -193,12 +218,10 @@ class DynamicQueryEngine:
                 continue
 
             try:
-                # Parse the column
                 parsed = pd.to_datetime(
                     self.df[col], format=EXCEL_DATE_FORMAT, errors="coerce"
                 )
 
-                # Compare dates
                 mask = parsed.dt.date == target_date
 
                 if mask.sum() > 0:
@@ -221,7 +244,6 @@ class DynamicQueryEngine:
     def get_data_summary_for_llm(self) -> str:
         """
         Generate a comprehensive summary of the data for the LLM.
-        All information comes from actual data analysis.
         """
         lines = [
             "=== DATA STRUCTURE ===",
@@ -249,16 +271,137 @@ class DynamicQueryEngine:
         return "\n".join(lines)
 
 
+def sanitize_for_json(obj):
+    """
+    Recursively sanitize an object for JSON serialization.
+    Converts NaN, Infinity, -Infinity to None or appropriate strings.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, (np.floating, np.integer)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj) if isinstance(obj, np.floating) else int(obj)
+    elif isinstance(obj, np.ndarray):
+        return sanitize_for_json(obj.tolist())
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+
+def dataframe_to_json_safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Convert DataFrame to list of dicts, handling NaN values properly.
+    """
+    # Replace NaN with None
+    df_clean = df.replace({np.nan: None, pd.NaT: None})
+
+    # Convert to records
+    records = df_clean.to_dict(orient="records")
+
+    # Sanitize each record
+    return sanitize_for_json(records)
+
+
+def detect_list_query(query: str) -> bool:
+    """
+    Detect if the user is asking for a list/table of data.
+    Returns True if it's a list query.
+    """
+    query_lower = query.lower()
+
+    # Patterns that indicate list/table requests
+    list_patterns = [
+        r"\blist\b",
+        r"\bshow\s+(me\s+)?(all|the)\b",
+        r"\bshow\s+all\b",
+        r"\bdisplay\b",
+        r"\bget\s+(me\s+)?(all|the)\b",
+        r"\bfetch\s+(all|the)\b",
+        r"\bgive\s+(me\s+)?(all|the|a\s+list)\b",
+        r"\bwhat\s+are\s+(all\s+)?(the\s+)?",
+        r"\bwhich\s+(all\s+)?",
+        r"\bfind\s+(all|the)\b",
+        r"\ball\s+(the\s+)?\w+\s+(with|where|having|from|in)\b",
+        r"\beveryone\b",
+        r"\ball\s+(orders|records|entries|items|customers|users|products|transactions)\b",
+        r"\bdetails\s+of\s+(all|the)\b",
+        r"\bentire\s+list\b",
+        r"\bcomplete\s+list\b",
+        r"\bexport\b",
+        r"\btable\s+of\b",
+    ]
+
+    for pattern in list_patterns:
+        if re.search(pattern, query_lower):
+            return True
+
+    return False
+
+
+def detect_query_type(query: str, components: Dict[str, Any]) -> str:
+    """
+    Determine the type of query based on question and components.
+    Returns: "list", "count", "sum", "specific_value", "filter_only"
+    """
+    query_lower = query.lower()
+
+    # Check for count queries
+    count_patterns = [
+        r"\bhow\s+many\b",
+        r"\bcount\s+(of|the)?\b",
+        r"\bnumber\s+of\b",
+        r"\btotal\s+count\b",
+    ]
+    for pattern in count_patterns:
+        if re.search(pattern, query_lower):
+            return "count"
+
+    # Check for sum/total queries
+    sum_patterns = [
+        r"\btotal\s+(amount|value|sum|price|cost)\b",
+        r"\bsum\s+of\b",
+        r"\baggregate\b",
+        r"\bcombined\s+(total|amount)\b",
+    ]
+    for pattern in sum_patterns:
+        if re.search(pattern, query_lower):
+            return "sum"
+
+    # Check for list queries
+    if detect_list_query(query):
+        return "list"
+
+    # Check for specific value queries (what is the X of Y)
+    specific_patterns = [
+        r"\bwhat\s+is\s+(the\s+)?\w+\s+(of|for)\b",
+        r"\btell\s+me\s+(the\s+)?\w+\s+(of|for)\b",
+        r"\bwhat\'s\s+(the\s+)?\b",
+    ]
+    for pattern in specific_patterns:
+        if re.search(pattern, query_lower):
+            return "specific_value"
+
+    # Use LLM-extracted type if available
+    llm_type = components.get("question_type", "list")
+
+    return llm_type
+
+
 def extract_query_components_with_llm(
     query: str, engine: DynamicQueryEngine
 ) -> Dict[str, Any]:
     """
     Use LLM to understand the query in context of the actual data.
-    The LLM sees the real data structure and extracts components accordingly.
     """
     data_summary = engine.get_data_summary_for_llm()
-
-    # Show sample rows
     sample_data = engine.df.head(3).to_string(index=False)
 
     prompt = f"""You are analyzing a user's question about data in an Excel file.
@@ -288,14 +431,17 @@ Respond with a JSON object containing:
 
 4. "target_attribute": The specific piece of information the user wants to know
    - This should be a description like "payment method", "status", "total amount", etc.
-   - Or null if they want all information
+   - Or null if they want all information / a list
 
 5. "question_type": One of "specific_value", "count", "sum", "list", "filter_only"
    - "specific_value": User wants one specific attribute (e.g., "what is the payment mode")
    - "count": User wants a count (e.g., "how many orders")
    - "sum": User wants a total (e.g., "total amount")
-   - "list": User wants to see matching records
+   - "list": User wants to see multiple matching records
    - "filter_only": User just wants filtered data
+
+6. "columns_to_display": List of column names the user wants to see, or null for all columns
+   - If user says "show names and emails", extract ["name", "email"] or similar column names from the data
 
 IMPORTANT:
 - Base your extraction on the ACTUAL column names and values shown above
@@ -320,7 +466,6 @@ Respond ONLY with valid JSON, no other text:
 
         response_text = response.choices[0].message.content.strip()
 
-        # Clean markdown if present
         if "```" in response_text:
             response_text = re.sub(r"```json?\s*", "", response_text)
             response_text = re.sub(r"```\s*$", "", response_text)
@@ -340,7 +485,56 @@ Respond ONLY with valid JSON, no other text:
             "numeric_values": [],
             "target_attribute": None,
             "question_type": "list",
+            "columns_to_display": None,
         }
+
+
+def generate_intro_message(
+    query: str, row_count: int, filter_description: str = ""
+) -> str:
+    """
+    Generate a brief introductory message for list responses.
+    This is a SHORT message, not the data itself.
+    """
+    try:
+        prompt = f"""Generate a brief, friendly one-sentence introduction for displaying data results.
+
+User's question: "{query}"
+Number of records found: {row_count}
+Filters applied: {filter_description if filter_description else "None"}
+
+Generate ONLY a brief intro sentence like:
+- "Here are the 5 orders from November 2024:"
+- "Found 12 customers matching your criteria:"
+- "Here's the complete list of pending transactions:"
+
+Keep it under 15 words. End with a colon. Do not include the actual data.
+"""
+
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You generate brief introductory sentences. Keep responses under 15 words.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=50,
+        )
+
+        intro = response.choices[0].message.content.strip()
+
+        # Ensure it ends with a colon
+        if not intro.endswith(":"):
+            intro = intro.rstrip(".") + ":"
+
+        return intro
+
+    except Exception as e:
+        logger.error(f"Intro generation failed: {e}")
+        return f"Found {row_count} matching records:"
 
 
 def find_target_column_with_llm(
@@ -388,11 +582,9 @@ Respond with ONLY the exact column name from the list above, or "NONE" if no col
 
         result = response.choices[0].message.content.strip()
 
-        # Verify the column exists
         if result in engine.columns:
             return result
 
-        # Try case-insensitive match
         for col in engine.columns:
             if col.lower() == result.lower():
                 return col
@@ -404,25 +596,97 @@ Respond with ONLY the exact column name from the list above, or "NONE" if no col
         return None
 
 
+def dataframe_to_markdown(df: pd.DataFrame, max_rows: Optional[int] = None) -> str:
+    """
+    Convert a DataFrame to a clean Markdown table.
+    """
+    if df.empty:
+        return "No data found."
+
+    display_df = df.head(max_rows) if max_rows else df
+
+    # Build markdown table
+    headers = list(display_df.columns)
+    header_row = "| " + " | ".join(str(h) for h in headers) + " |"
+    separator = "| " + " | ".join("---" for _ in headers) + " |"
+
+    rows = []
+    for _, row in display_df.iterrows():
+        row_str = "| " + " | ".join(str(v) if pd.notna(v) else "" for v in row) + " |"
+        rows.append(row_str)
+
+    markdown = "\n".join([header_row, separator] + rows)
+
+    if max_rows and len(df) > max_rows:
+        markdown += f"\n\n*... and {len(df) - max_rows} more rows*"
+
+    return markdown
+
+
+def dataframe_to_html(df: pd.DataFrame, max_rows: Optional[int] = None) -> str:
+    """
+    Convert a DataFrame to an HTML table with styling.
+    """
+    if df.empty:
+        return "<p>No data found.</p>"
+
+    display_df = df.head(max_rows) if max_rows else df
+
+    html = display_df.to_html(index=False, classes="data-table", border=0, na_rep="")
+
+    # Add basic styling
+    styled_html = f"""
+<style>
+.data-table {{
+    border-collapse: collapse;
+    width: 100%;
+    font-family: Arial, sans-serif;
+    font-size: 14px;
+}}
+.data-table th {{
+    background-color: #4CAF50;
+    color: white;
+    padding: 12px 8px;
+    text-align: left;
+    border-bottom: 2px solid #ddd;
+}}
+.data-table td {{
+    padding: 10px 8px;
+    border-bottom: 1px solid #ddd;
+}}
+.data-table tr:nth-child(even) {{
+    background-color: #f9f9f9;
+}}
+.data-table tr:hover {{
+    background-color: #f1f1f1;
+}}
+</style>
+{html}
+"""
+
+    if max_rows and len(df) > max_rows:
+        styled_html += f"<p><em>... and {len(df) - max_rows} more rows</em></p>"
+
+    return styled_html
+
+
 def execute_dynamic_query(
     engine: DynamicQueryEngine, components: Dict[str, Any], query: str
-) -> Dict[str, Any]:
+) -> QueryResult:
     """
     Execute the query using extracted components.
-    All filtering is data-driven based on where values are actually found.
+    Returns a QueryResult with proper type distinction.
     """
-    result = {
-        "success": False,
-        "answer": "NO_MATCH",
-        "debug": {
-            "components": components,
-            "filters_applied": [],
-            "rows_progression": [len(engine.df)],
-        },
+    result = QueryResult()
+    result.debug = {
+        "components": components,
+        "filters_applied": [],
+        "rows_progression": [len(engine.df)],
     }
 
     current_df = engine.df.copy()
     combined_mask = pd.Series(True, index=engine.df.index)
+    filter_descriptions = []
 
     # 1. Apply text search filters
     search_terms = components.get("search_terms", [])
@@ -433,33 +697,26 @@ def execute_dynamic_query(
         findings = engine.find_value_in_dataframe(str(term))
 
         if findings:
-            # Use the most selective column (first in sorted list)
             best_finding = findings[0]
 
-            # Only apply if it's selective enough (not matching everything)
             if best_finding["selectivity"] < 0.8:
                 combined_mask &= best_finding["mask"]
-                result["debug"]["filters_applied"].append(
+                filter_descriptions.append(f"{best_finding['column']}='{term}'")
+                result.debug["filters_applied"].append(
                     {
                         "type": "text_search",
                         "term": term,
                         "column": best_finding["column"],
                         "matches": best_finding["contains_matches"],
-                        "selectivity": best_finding["selectivity"],
                     }
                 )
 
                 temp_count = combined_mask.sum()
-                result["debug"]["rows_progression"].append(int(temp_count))
-
-                logger.info(
-                    f"Text filter '{term}' on column '{best_finding['column']}': "
-                    f"{best_finding['contains_matches']} matches, {temp_count} remaining"
-                )
+                result.debug["rows_progression"].append(int(temp_count))
 
                 if temp_count == 0:
-                    logger.warning(f"Filter '{term}' eliminated all rows, reverting")
-                    combined_mask |= best_finding["mask"]  # Revert by OR-ing back
+                    combined_mask |= best_finding["mask"]
+                    filter_descriptions.pop()
 
     # 2. Apply date filter
     date_value = components.get("date_value")
@@ -470,35 +727,26 @@ def execute_dynamic_query(
 
             if date_findings:
                 best_date = date_findings[0]
-
-                # Apply date filter
                 new_mask = combined_mask & best_date["mask"]
 
                 if new_mask.sum() > 0:
                     combined_mask = new_mask
-                    result["debug"]["filters_applied"].append(
+                    filter_descriptions.append(f"{best_date['column']}='{date_value}'")
+                    result.debug["filters_applied"].append(
                         {
                             "type": "date_filter",
                             "date": date_value,
                             "column": best_date["column"],
-                            "matches": best_date["match_count"],
                         }
                     )
-                    result["debug"]["rows_progression"].append(int(combined_mask.sum()))
-
-                    logger.info(
-                        f"Date filter '{date_value}' on column '{best_date['column']}': "
-                        f"{combined_mask.sum()} remaining"
-                    )
-                else:
-                    logger.warning(f"Date filter would eliminate all rows, skipping")
+                    result.debug["rows_progression"].append(int(combined_mask.sum()))
 
         except Exception as e:
             logger.error(f"Date parsing error: {e}")
 
-    # 3. Apply numeric filter (for verification/refinement)
+    # 3. Apply numeric filter
     numeric_values = components.get("numeric_values", [])
-    if numeric_values and combined_mask.sum() > 1:  # Only if multiple rows remain
+    if numeric_values and combined_mask.sum() > 1:
         for num in numeric_values:
             try:
                 num_findings = engine.find_number_in_dataframe(float(num))
@@ -506,27 +754,21 @@ def execute_dynamic_query(
                 if num_findings:
                     best_num = num_findings[0]
 
-                    # Only apply if selective
                     if best_num["selectivity"] < 0.5:
                         new_mask = combined_mask & best_num["mask"]
 
                         if new_mask.sum() > 0:
                             combined_mask = new_mask
-                            result["debug"]["filters_applied"].append(
+                            filter_descriptions.append(f"{best_num['column']}={num}")
+                            result.debug["filters_applied"].append(
                                 {
                                     "type": "numeric_filter",
                                     "value": num,
                                     "column": best_num["column"],
-                                    "matches": best_num["match_count"],
                                 }
                             )
-                            result["debug"]["rows_progression"].append(
+                            result.debug["rows_progression"].append(
                                 int(combined_mask.sum())
-                            )
-
-                            logger.info(
-                                f"Numeric filter '{num}' on column '{best_num['column']}': "
-                                f"{combined_mask.sum()} remaining"
                             )
 
             except Exception as e:
@@ -534,70 +776,112 @@ def execute_dynamic_query(
 
     # 4. Get filtered dataframe
     filtered_df = engine.df[combined_mask]
-    result["debug"]["final_row_count"] = len(filtered_df)
+    result.debug["final_row_count"] = len(filtered_df)
+    result.total_rows = len(filtered_df)
 
     if filtered_df.empty:
-        result["answer"] = "NO_MATCH"
+        result.success = False
+        result.response_type = "text"
+        result.scalar_value = "NO_MATCH"
         return result
 
-    # 5. Extract the target attribute
-    target_description = components.get("target_attribute")
-    question_type = components.get("question_type", "list")
+    # 5. Determine query type and handle accordingly
+    query_type = detect_query_type(query, components)
 
-    if question_type == "count":
-        result["answer"] = str(len(filtered_df))
-        result["success"] = True
+    filter_desc = ", ".join(filter_descriptions) if filter_descriptions else ""
+
+    # Handle COUNT queries
+    if query_type == "count":
+        result.success = True
+        result.response_type = "count"
+        result.scalar_value = str(len(filtered_df))
+        result.intro_message = f"The count is {len(filtered_df)}."
         return result
 
-    if question_type == "sum" and target_description:
-        # Find numeric column matching the description
-        target_col = find_target_column_with_llm(query, target_description, engine)
-        if target_col and engine.column_profiles[target_col]["type"] == "numeric":
-            total = filtered_df[target_col].sum()
-            result["answer"] = str(total)
-            result["success"] = True
-            return result
+    # Handle SUM queries
+    if query_type == "sum":
+        target_description = components.get("target_attribute")
+        if target_description:
+            target_col = find_target_column_with_llm(query, target_description, engine)
+            if target_col and engine.column_profiles[target_col]["type"] == "numeric":
+                total = filtered_df[target_col].sum()
+                result.success = True
+                result.response_type = "value"
+                result.scalar_value = str(total)
+                result.intro_message = f"The total {target_description} is {total}."
+                return result
 
-    if target_description:
-        target_col = find_target_column_with_llm(query, target_description, engine)
-        result["debug"]["target_column"] = target_col
+    # Handle SPECIFIC VALUE queries
+    if query_type == "specific_value":
+        target_description = components.get("target_attribute")
+        if target_description:
+            target_col = find_target_column_with_llm(query, target_description, engine)
 
-        if target_col and target_col in filtered_df.columns:
-            values = filtered_df[target_col].dropna().unique()
+            if target_col and target_col in filtered_df.columns:
+                values = filtered_df[target_col].dropna().unique()
 
-            if len(values) == 1:
-                result["answer"] = str(values[0])
-                result["success"] = True
-            elif len(values) > 1:
-                result["answer"] = (
-                    f"Multiple values found: {', '.join(str(v) for v in values[:10])}"
-                )
-                result["success"] = True
-            else:
-                result["answer"] = "No value found in the matching row(s)"
+                if len(values) == 1:
+                    result.success = True
+                    result.response_type = "value"
+                    result.scalar_value = str(values[0])
+                    return result
+                elif len(values) > 1 and len(values) <= 5:
+                    result.success = True
+                    result.response_type = "value"
+                    result.scalar_value = ", ".join(str(v) for v in values)
+                    return result
+                # If many values, fall through to list handling
 
-            return result
+    # Handle LIST queries (default for multiple results)
+    if query_type == "list" or len(filtered_df) > 1:
+        result.success = True
+        result.response_type = "table"
 
-    # 6. Default: return filtered data
-    if len(filtered_df) <= 10:
-        result["answer"] = filtered_df.to_string(index=False)
-    else:
-        result["answer"] = (
-            f"Found {len(filtered_df)} matching rows:\n\n{filtered_df.head(10).to_string(index=False)}"
+        # Select columns if specified
+        columns_to_display = components.get("columns_to_display")
+        if columns_to_display:
+            # Match requested columns to actual columns
+            matched_cols = []
+            for req_col in columns_to_display:
+                for actual_col in filtered_df.columns:
+                    if (
+                        req_col.lower() in actual_col.lower()
+                        or actual_col.lower() in req_col.lower()
+                    ):
+                        if actual_col not in matched_cols:
+                            matched_cols.append(actual_col)
+                        break
+
+            if matched_cols:
+                filtered_df = filtered_df[matched_cols]
+
+        result.raw_data = filtered_df
+        result.intro_message = generate_intro_message(
+            query, len(filtered_df), filter_desc
         )
+        return result
 
-    result["success"] = True
+    # Default: return as table
+    result.success = True
+    result.response_type = "table"
+    result.raw_data = filtered_df
+    result.intro_message = generate_intro_message(query, len(filtered_df), filter_desc)
     return result
 
 
-def execute_pandas_retrieval(file_name: str, query: str) -> str:
+def execute_pandas_retrieval(file_name: str, query: str) -> Dict[str, Any]:
     """
     Main entry point for dynamic pandas-based data retrieval.
+    Returns a structured result that can be handled by the route.
     """
     file_path = os.path.join(UPLOADS_DIR, file_name)
 
     if not os.path.exists(file_path):
-        return "Error: Source file not found."
+        return {
+            "success": False,
+            "response_type": "error",
+            "answer": "Error: Source file not found.",
+        }
 
     try:
         # Load Excel file
@@ -611,43 +895,73 @@ def execute_pandas_retrieval(file_name: str, query: str) -> str:
         # Initialize dynamic query engine
         engine = DynamicQueryEngine(df)
 
-        # Log discovered column types
-        for col, profile in engine.column_profiles.items():
-            logger.info(
-                f"Column '{col}': type={profile['type']}, unique={profile['unique_count']}"
-            )
-
-        # Step 1: Extract query components using LLM (with data context)
+        # Step 1: Extract query components using LLM
         components = extract_query_components_with_llm(query, engine)
 
         # Step 2: Execute the query dynamically
         result = execute_dynamic_query(engine, components, query)
 
-        logger.info(f"Query result: success={result['success']}")
-        logger.info(f"Debug info: {result['debug']}")
+        logger.info(
+            f"Query result: success={result.success}, type={result.response_type}"
+        )
 
-        # Step 3: If failed, try alternative approach
-        if not result["success"] or result["answer"] == "NO_MATCH":
-            logger.info(
-                "Primary approach failed, trying direct LLM query generation..."
-            )
-            alternative_result = _direct_llm_query(df, engine, query)
-            if alternative_result and alternative_result != "NO_MATCH":
-                return alternative_result
+        # Step 3: Format the response based on type
+        if result.response_type == "table" and result.raw_data is not None:
+            # Use JSON-safe conversion for table_data
+            table_data = dataframe_to_json_safe_records(result.raw_data)
 
-        return result["answer"]
+            return {
+                "success": True,
+                "response_type": "table",
+                "intro_message": result.intro_message,
+                "table_data": table_data,  # Now JSON-safe
+                "table_markdown": dataframe_to_markdown(result.raw_data),
+                "table_html": dataframe_to_html(result.raw_data),
+                "columns": list(result.raw_data.columns),
+                "total_rows": len(result.raw_data),
+                "debug": sanitize_for_json(result.debug),  # Also sanitize debug info
+            }
+
+        elif result.response_type in ["count", "value"]:
+            return {
+                "success": True,
+                "response_type": result.response_type,
+                "answer": result.scalar_value,
+                "intro_message": result.intro_message,
+                "debug": sanitize_for_json(result.debug),
+            }
+
+        else:
+            # Fallback or NO_MATCH
+            if result.scalar_value == "NO_MATCH":
+                # Try alternative approach
+                alt_result = _direct_llm_query(df, engine, query)
+                if alt_result and alt_result.get("success"):
+                    return alt_result
+
+            return {
+                "success": False,
+                "response_type": "text",
+                "answer": result.scalar_value or "NO_MATCH",
+                "debug": sanitize_for_json(result.debug),
+            }
 
     except Exception as e:
         logger.error(f"Error: {traceback.format_exc()}")
-        return f"Error: {str(e)}"
+        return {
+            "success": False,
+            "response_type": "error",
+            "answer": f"Error: {str(e)}",
+        }
 
 
-def _direct_llm_query(df: pd.DataFrame, engine: DynamicQueryEngine, query: str) -> str:
+def _direct_llm_query(
+    df: pd.DataFrame, engine: DynamicQueryEngine, query: str
+) -> Dict[str, Any]:
     """
     Fallback: Let LLM generate specific filter conditions based on actual data.
     """
     try:
-        # Show the LLM actual data samples
         data_summary = engine.get_data_summary_for_llm()
         sample_rows = df.head(5).to_string(index=False)
 
@@ -672,6 +986,7 @@ Respond with JSON:
         {{"column": "exact_column_name_from_data", "value": "exact_value_to_search", "match_type": "exact|contains"}}
     ],
     "answer_column": "exact_column_name_containing_answer",
+    "return_all_columns": true/false,
     "reasoning": "brief explanation"
 }}
 
@@ -711,12 +1026,10 @@ Use EXACT column names and realistic values based on the data shown.
             match_type = f.get("match_type", "contains")
 
             if col not in filtered_df.columns:
-                logger.warning(f"Column '{col}' not found")
                 continue
 
             col_profile = engine.column_profiles.get(col, {})
 
-            # Handle date columns
             if col_profile.get("type") == "datetime":
                 try:
                     parsed_col = pd.to_datetime(
@@ -727,11 +1040,9 @@ Use EXACT column names and realistic values based on the data shown.
                     new_df = filtered_df[mask]
                     if len(new_df) > 0:
                         filtered_df = new_df
-                        logger.info(f"Date filter on '{col}': {len(filtered_df)} rows")
-                except Exception as e:
-                    logger.error(f"Date filter error: {e}")
+                except Exception:
+                    pass
 
-            # Handle numeric columns
             elif col_profile.get("type") == "numeric":
                 try:
                     num_val = float(val)
@@ -739,13 +1050,9 @@ Use EXACT column names and realistic values based on the data shown.
                     new_df = filtered_df[mask]
                     if len(new_df) > 0:
                         filtered_df = new_df
-                        logger.info(
-                            f"Numeric filter on '{col}': {len(filtered_df)} rows"
-                        )
-                except Exception as e:
-                    logger.error(f"Numeric filter error: {e}")
+                except Exception:
+                    pass
 
-            # Handle text columns
             else:
                 val_lower = str(val).lower()
                 if match_type == "exact":
@@ -761,28 +1068,56 @@ Use EXACT column names and realistic values based on the data shown.
                 new_df = filtered_df[mask]
                 if len(new_df) > 0:
                     filtered_df = new_df
-                    logger.info(
-                        f"Text filter on '{col}' with '{val}': {len(filtered_df)} rows"
-                    )
 
         if filtered_df.empty:
-            return "NO_MATCH"
+            return {"success": False, "response_type": "text", "answer": "NO_MATCH"}
 
-        # Extract answer
+        # Check if list or specific value
+        is_list_query = detect_list_query(query) or parsed.get(
+            "return_all_columns", False
+        )
+
+        if is_list_query or len(filtered_df) > 1:
+            # Use JSON-safe conversion
+            table_data = dataframe_to_json_safe_records(filtered_df)
+
+            return {
+                "success": True,
+                "response_type": "table",
+                "intro_message": generate_intro_message(query, len(filtered_df)),
+                "table_data": table_data,  # JSON-safe
+                "table_markdown": dataframe_to_markdown(filtered_df),
+                "table_html": dataframe_to_html(filtered_df),
+                "columns": list(filtered_df.columns),
+                "total_rows": len(filtered_df),
+            }
+
         answer_col = parsed.get("answer_column")
         if answer_col and answer_col in filtered_df.columns:
             values = filtered_df[answer_col].dropna().unique()
             if len(values) == 1:
-                return str(values[0])
-            elif len(values) > 1:
-                return f"Multiple values: {', '.join(str(v) for v in values[:10])}"
+                # Sanitize the value
+                value = sanitize_for_json(values[0])
+                return {
+                    "success": True,
+                    "response_type": "value",
+                    "answer": str(value) if value is not None else "N/A",
+                }
 
-        # Return data if no specific answer column
-        if len(filtered_df) <= 10:
-            return filtered_df.to_string(index=False)
+        # Use JSON-safe conversion
+        table_data = dataframe_to_json_safe_records(filtered_df)
 
-        return f"Found {len(filtered_df)} rows:\n{filtered_df.head(10).to_string(index=False)}"
+        return {
+            "success": True,
+            "response_type": "table",
+            "intro_message": generate_intro_message(query, len(filtered_df)),
+            "table_data": table_data,
+            "table_markdown": dataframe_to_markdown(filtered_df),
+            "table_html": dataframe_to_html(filtered_df),
+            "columns": list(filtered_df.columns),
+            "total_rows": len(filtered_df),
+        }
 
     except Exception as e:
         logger.error(f"Direct LLM query failed: {e}")
-        return "NO_MATCH"
+        return {"success": False, "response_type": "text", "answer": "NO_MATCH"}
