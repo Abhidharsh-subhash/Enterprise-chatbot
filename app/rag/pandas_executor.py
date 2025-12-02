@@ -1,18 +1,84 @@
 # pandas_executor.py
 import os
 import re
+import math
 import pandas as pd
+import numpy as np
 import traceback
 from typing import Optional, List, Dict, Any, Tuple
 from app.core.openai_client import client, CHAT_MODEL
 from app.core.logger import logger
-import math
-import numpy as np
 
 UPLOADS_DIR = os.path.abspath("./uploads")
 
 # Your fixed Excel date format
 EXCEL_DATE_FORMAT = "%m/%d/%Y %H:%M:%S"
+
+
+# ============================================================================
+# JSON SANITIZATION HELPERS
+# ============================================================================
+
+
+def sanitize_for_json(obj):
+    """
+    Recursively sanitize an object for JSON serialization.
+    Converts NaN, Infinity, -Infinity to None.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, (np.floating,)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return sanitize_for_json(obj.tolist())
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat() if pd.notna(obj) else None
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+
+def dataframe_to_json_safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Convert DataFrame to list of dicts, handling NaN values properly.
+    """
+    # Create a copy to avoid modifying original
+    df_clean = df.copy()
+
+    # Convert timestamps to strings
+    for col in df_clean.columns:
+        if pd.api.types.is_datetime64_any_dtype(df_clean[col]):
+            df_clean[col] = df_clean[col].apply(
+                lambda x: x.isoformat() if pd.notna(x) else None
+            )
+
+    # Replace NaN with None
+    df_clean = df_clean.replace({np.nan: None})
+
+    # Handle any remaining NaT values
+    df_clean = df_clean.where(pd.notnull(df_clean), None)
+
+    # Convert to records
+    records = df_clean.to_dict(orient="records")
+
+    # Final sanitization pass
+    return sanitize_for_json(records)
+
+
+# ============================================================================
+# QUERY RESULT CLASS
+# ============================================================================
 
 
 class QueryResult:
@@ -41,6 +107,11 @@ class QueryResult:
         }
 
 
+# ============================================================================
+# DYNAMIC QUERY ENGINE
+# ============================================================================
+
+
 class DynamicQueryEngine:
     """
     A fully dynamic query engine that learns everything from the data.
@@ -66,18 +137,29 @@ class DynamicQueryEngine:
             profile = {
                 "name": col,
                 "dtype": str(series.dtype),
-                "null_count": series.isna().sum(),
+                "null_count": int(series.isna().sum()),
                 "total_count": len(series),
-                "unique_count": series.nunique(),
-                "unique_ratio": series.nunique() / max(len(series), 1),
+                "unique_count": int(series.nunique()),
+                "unique_ratio": float(series.nunique() / max(len(series), 1)),
             }
 
             # Detect if numeric
             if pd.api.types.is_numeric_dtype(series):
                 profile["type"] = "numeric"
-                profile["min"] = float(series.min()) if len(non_null) > 0 else None
-                profile["max"] = float(series.max()) if len(non_null) > 0 else None
-                profile["mean"] = float(series.mean()) if len(non_null) > 0 else None
+                if len(non_null) > 0:
+                    profile["min"] = (
+                        float(series.min()) if not pd.isna(series.min()) else None
+                    )
+                    profile["max"] = (
+                        float(series.max()) if not pd.isna(series.max()) else None
+                    )
+                    profile["mean"] = (
+                        float(series.mean()) if not pd.isna(series.mean()) else None
+                    )
+                else:
+                    profile["min"] = None
+                    profile["max"] = None
+                    profile["mean"] = None
 
             # Detect if datetime
             elif pd.api.types.is_datetime64_any_dtype(series):
@@ -160,7 +242,7 @@ class DynamicQueryEngine:
                         "column": col,
                         "exact_matches": int(exact_count),
                         "contains_matches": int(contains_count),
-                        "selectivity": contains_count / len(self.df),
+                        "selectivity": float(contains_count / len(self.df)),
                         "matched_values": [str(v) for v in matched_values],
                         "mask": contains_mask,
                     }
@@ -194,7 +276,7 @@ class DynamicQueryEngine:
                         {
                             "column": col,
                             "match_count": int(mask.sum()),
-                            "selectivity": mask.sum() / len(self.df),
+                            "selectivity": float(mask.sum() / len(self.df)),
                             "mask": mask,
                         }
                     )
@@ -229,7 +311,7 @@ class DynamicQueryEngine:
                         {
                             "column": col,
                             "match_count": int(mask.sum()),
-                            "selectivity": mask.sum() / len(self.df),
+                            "selectivity": float(mask.sum() / len(self.df)),
                             "mask": mask,
                         }
                     )
@@ -271,43 +353,9 @@ class DynamicQueryEngine:
         return "\n".join(lines)
 
 
-def sanitize_for_json(obj):
-    """
-    Recursively sanitize an object for JSON serialization.
-    Converts NaN, Infinity, -Infinity to None or appropriate strings.
-    """
-    if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_for_json(item) for item in obj]
-    elif isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    elif isinstance(obj, (np.floating, np.integer)):
-        if np.isnan(obj) or np.isinf(obj):
-            return None
-        return float(obj) if isinstance(obj, np.floating) else int(obj)
-    elif isinstance(obj, np.ndarray):
-        return sanitize_for_json(obj.tolist())
-    elif pd.isna(obj):
-        return None
-    else:
-        return obj
-
-
-def dataframe_to_json_safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    Convert DataFrame to list of dicts, handling NaN values properly.
-    """
-    # Replace NaN with None
-    df_clean = df.replace({np.nan: None, pd.NaT: None})
-
-    # Convert to records
-    records = df_clean.to_dict(orient="records")
-
-    # Sanitize each record
-    return sanitize_for_json(records)
+# ============================================================================
+# QUERY TYPE DETECTION
+# ============================================================================
 
 
 def detect_list_query(query: str) -> bool:
@@ -337,6 +385,8 @@ def detect_list_query(query: str) -> bool:
         r"\bcomplete\s+list\b",
         r"\bexport\b",
         r"\btable\s+of\b",
+        r"\bgive\s+me\s+the\s+details\b",
+        r"\bdetails\s+of\b",
     ]
 
     for pattern in list_patterns:
@@ -395,6 +445,11 @@ def detect_query_type(query: str, components: Dict[str, Any]) -> str:
     return llm_type
 
 
+# ============================================================================
+# LLM HELPERS
+# ============================================================================
+
+
 def extract_query_components_with_llm(
     query: str, engine: DynamicQueryEngine
 ) -> Dict[str, Any]:
@@ -424,29 +479,33 @@ Respond with a JSON object containing:
    - Look at the sample data and column values above to identify what the user might be referring to
 
 2. "date_value": A date mentioned in the question, converted to "YYYY-MM-DD" format, or null if no date
-   - Handle formats like "14th nov 2025", "november 14, 2025", etc.
+   - Handle formats like "14th nov 2025", "november 14, 2025", "17th November 5:56pm", etc.
 
-3. "numeric_values": List of numbers mentioned (excluding years), or empty list
+3. "time_value": A specific time mentioned (like "5:56pm"), in "HH:MM:SS" 24-hour format, or null
+   - Convert "5:56pm" to "17:56:00"
+
+4. "numeric_values": List of numbers mentioned (excluding years), or empty list
    - Include amounts, quantities, prices, etc.
 
-4. "target_attribute": The specific piece of information the user wants to know
+5. "target_attribute": The specific piece of information the user wants to know
    - This should be a description like "payment method", "status", "total amount", etc.
    - Or null if they want all information / a list
 
-5. "question_type": One of "specific_value", "count", "sum", "list", "filter_only"
+6. "question_type": One of "specific_value", "count", "sum", "list", "filter_only"
    - "specific_value": User wants one specific attribute (e.g., "what is the payment mode")
    - "count": User wants a count (e.g., "how many orders")
    - "sum": User wants a total (e.g., "total amount")
-   - "list": User wants to see multiple matching records
+   - "list": User wants to see matching records or details
    - "filter_only": User just wants filtered data
 
-6. "columns_to_display": List of column names the user wants to see, or null for all columns
+7. "columns_to_display": List of column names the user wants to see, or null for all columns
    - If user says "show names and emails", extract ["name", "email"] or similar column names from the data
 
 IMPORTANT:
 - Base your extraction on the ACTUAL column names and values shown above
 - The search_terms should be things that would actually appear in the data
 - Be precise - extract exactly what's in the question
+- "give me the details" means user wants ALL columns (list type)
 
 Respond ONLY with valid JSON, no other text:
 """
@@ -482,6 +541,7 @@ Respond ONLY with valid JSON, no other text:
         return {
             "search_terms": [],
             "date_value": None,
+            "time_value": None,
             "numeric_values": [],
             "target_attribute": None,
             "question_type": "list",
@@ -507,6 +567,7 @@ Generate ONLY a brief intro sentence like:
 - "Here are the 5 orders from November 2024:"
 - "Found 12 customers matching your criteria:"
 - "Here's the complete list of pending transactions:"
+- "Here are the details of the order closed on November 17th:"
 
 Keep it under 15 words. End with a colon. Do not include the actual data.
 """
@@ -596,6 +657,11 @@ Respond with ONLY the exact column name from the list above, or "NONE" if no col
         return None
 
 
+# ============================================================================
+# DATA FORMATTING
+# ============================================================================
+
+
 def dataframe_to_markdown(df: pd.DataFrame, max_rows: Optional[int] = None) -> str:
     """
     Convert a DataFrame to a clean Markdown table.
@@ -612,7 +678,15 @@ def dataframe_to_markdown(df: pd.DataFrame, max_rows: Optional[int] = None) -> s
 
     rows = []
     for _, row in display_df.iterrows():
-        row_str = "| " + " | ".join(str(v) if pd.notna(v) else "" for v in row) + " |"
+        row_values = []
+        for v in row:
+            if pd.isna(v):
+                row_values.append("")
+            elif isinstance(v, pd.Timestamp):
+                row_values.append(v.strftime("%Y-%m-%d %H:%M:%S"))
+            else:
+                row_values.append(str(v))
+        row_str = "| " + " | ".join(row_values) + " |"
         rows.append(row_str)
 
     markdown = "\n".join([header_row, separator] + rows)
@@ -632,7 +706,17 @@ def dataframe_to_html(df: pd.DataFrame, max_rows: Optional[int] = None) -> str:
 
     display_df = df.head(max_rows) if max_rows else df
 
-    html = display_df.to_html(index=False, classes="data-table", border=0, na_rep="")
+    # Clean the dataframe for HTML
+    display_df_clean = display_df.copy()
+    for col in display_df_clean.columns:
+        if pd.api.types.is_datetime64_any_dtype(display_df_clean[col]):
+            display_df_clean[col] = display_df_clean[col].apply(
+                lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(x) else ""
+            )
+
+    html = display_df_clean.to_html(
+        index=False, classes="data-table", border=0, na_rep=""
+    )
 
     # Add basic styling
     styled_html = f"""
@@ -670,6 +754,11 @@ def dataframe_to_html(df: pd.DataFrame, max_rows: Optional[int] = None) -> str:
     return styled_html
 
 
+# ============================================================================
+# QUERY EXECUTION
+# ============================================================================
+
+
 def execute_dynamic_query(
     engine: DynamicQueryEngine, components: Dict[str, Any], query: str
 ) -> QueryResult:
@@ -684,7 +773,6 @@ def execute_dynamic_query(
         "rows_progression": [len(engine.df)],
     }
 
-    current_df = engine.df.copy()
     combined_mask = pd.Series(True, index=engine.df.index)
     filter_descriptions = []
 
@@ -744,7 +832,46 @@ def execute_dynamic_query(
         except Exception as e:
             logger.error(f"Date parsing error: {e}")
 
-    # 3. Apply numeric filter
+    # 3. Apply time filter if specified
+    time_value = components.get("time_value")
+    if time_value and date_value:
+        try:
+            # Find datetime columns and filter by time
+            for col in engine.columns:
+                profile = engine.column_profiles[col]
+                if profile["type"] != "datetime":
+                    continue
+
+                parsed = pd.to_datetime(
+                    engine.df[col], format=EXCEL_DATE_FORMAT, errors="coerce"
+                )
+
+                # Parse target time
+                target_time = pd.to_datetime(time_value).time()
+
+                # Create time mask with some tolerance (within 1 minute)
+                time_mask = (parsed.dt.hour == target_time.hour) & (
+                    parsed.dt.minute == target_time.minute
+                )
+
+                new_mask = combined_mask & time_mask
+                if new_mask.sum() > 0:
+                    combined_mask = new_mask
+                    filter_descriptions.append(f"time='{time_value}'")
+                    result.debug["filters_applied"].append(
+                        {
+                            "type": "time_filter",
+                            "time": time_value,
+                            "column": col,
+                        }
+                    )
+                    result.debug["rows_progression"].append(int(combined_mask.sum()))
+                    break
+
+        except Exception as e:
+            logger.debug(f"Time filter error: {e}")
+
+    # 4. Apply numeric filter
     numeric_values = components.get("numeric_values", [])
     if numeric_values and combined_mask.sum() > 1:
         for num in numeric_values:
@@ -774,7 +901,7 @@ def execute_dynamic_query(
             except Exception as e:
                 logger.debug(f"Numeric filter error: {e}")
 
-    # 4. Get filtered dataframe
+    # 5. Get filtered dataframe
     filtered_df = engine.df[combined_mask]
     result.debug["final_row_count"] = len(filtered_df)
     result.total_rows = len(filtered_df)
@@ -785,7 +912,7 @@ def execute_dynamic_query(
         result.scalar_value = "NO_MATCH"
         return result
 
-    # 5. Determine query type and handle accordingly
+    # 6. Determine query type and handle accordingly
     query_type = detect_query_type(query, components)
 
     filter_desc = ", ".join(filter_descriptions) if filter_descriptions else ""
@@ -823,17 +950,20 @@ def execute_dynamic_query(
                 if len(values) == 1:
                     result.success = True
                     result.response_type = "value"
-                    result.scalar_value = str(values[0])
+                    val = values[0]
+                    result.scalar_value = str(val) if not pd.isna(val) else "N/A"
                     return result
                 elif len(values) > 1 and len(values) <= 5:
                     result.success = True
                     result.response_type = "value"
-                    result.scalar_value = ", ".join(str(v) for v in values)
+                    result.scalar_value = ", ".join(
+                        str(v) for v in values if not pd.isna(v)
+                    )
                     return result
                 # If many values, fall through to list handling
 
-    # Handle LIST queries (default for multiple results)
-    if query_type == "list" or len(filtered_df) > 1:
+    # Handle LIST queries (default for multiple results or "give me details")
+    if query_type == "list" or len(filtered_df) >= 1:
         result.success = True
         result.response_type = "table"
 
@@ -867,6 +997,11 @@ def execute_dynamic_query(
     result.raw_data = filtered_df
     result.intro_message = generate_intro_message(query, len(filtered_df), filter_desc)
     return result
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 
 def execute_pandas_retrieval(file_name: str, query: str) -> Dict[str, Any]:
@@ -914,12 +1049,12 @@ def execute_pandas_retrieval(file_name: str, query: str) -> Dict[str, Any]:
                 "success": True,
                 "response_type": "table",
                 "intro_message": result.intro_message,
-                "table_data": table_data,  # Now JSON-safe
+                "table_data": table_data,  # JSON-safe
                 "table_markdown": dataframe_to_markdown(result.raw_data),
                 "table_html": dataframe_to_html(result.raw_data),
                 "columns": list(result.raw_data.columns),
                 "total_rows": len(result.raw_data),
-                "debug": sanitize_for_json(result.debug),  # Also sanitize debug info
+                "debug": sanitize_for_json(result.debug),
             }
 
         elif result.response_type in ["count", "value"]:
@@ -1085,7 +1220,7 @@ Use EXACT column names and realistic values based on the data shown.
                 "success": True,
                 "response_type": "table",
                 "intro_message": generate_intro_message(query, len(filtered_df)),
-                "table_data": table_data,  # JSON-safe
+                "table_data": table_data,
                 "table_markdown": dataframe_to_markdown(filtered_df),
                 "table_html": dataframe_to_html(filtered_df),
                 "columns": list(filtered_df.columns),
@@ -1096,12 +1231,11 @@ Use EXACT column names and realistic values based on the data shown.
         if answer_col and answer_col in filtered_df.columns:
             values = filtered_df[answer_col].dropna().unique()
             if len(values) == 1:
-                # Sanitize the value
-                value = sanitize_for_json(values[0])
+                val = values[0]
                 return {
                     "success": True,
                     "response_type": "value",
-                    "answer": str(value) if value is not None else "N/A",
+                    "answer": str(val) if not pd.isna(val) else "N/A",
                 }
 
         # Use JSON-safe conversion
