@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     # JWT
     secret_key: str = Field(env="SECRET_KEY")
     algorithm: str = Field(env="ALGORITHM")
-    access_token_expiry_time: int = Field(15, env="ACCESS_TOKEN_EXPIRE_TIME")
-    refresh_token_expiry_time: int = Field(30, env="REFRESH_TOKEN_EXPIRE_TIME")
+    access_token_expiry_time: int = Field(1500, env="ACCESS_TOKEN_EXPIRE_TIME")
+    refresh_token_expiry_time: int = Field(3000, env="REFRESH_TOKEN_EXPIRE_TIME")
 
     # Redis
     redis_url: str = Field(env="REDIS_URL")
@@ -32,10 +32,18 @@ class Settings(BaseSettings):
     sender_email: str = Field(env="SENDER_EMAIL")
     sender_password: str = Field(env="SENDER_PASSWORD")
 
+    # OpenAI
+    openai_model: str = Field(env="OPENAI_MODEL")
+    model_temperature: int = Field(0, env="MODEL_TEMPERATURE")
+    openai_api_key: str = Field(env="OPENAI_API_KEY")
+
+    # COT
+    memory_url: str = Field(env="MEMORY_URL")
+    vector_database: str = Field(env="VECTOR_DATABASE")
+
     class Config:
         env_file = ".env"
         extra = "ignore"
 
 
 settings = Settings()
-print(settings.debug)
