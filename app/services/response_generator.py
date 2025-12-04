@@ -130,14 +130,8 @@ Keep it brief and helpful.
 
     def _generate_empty_response(self, question: str) -> str:
         """Generate response for empty results"""
-        return f"""I searched the data but found no results matching your question: "{question}"
-
-This could mean:
-- There's no data matching your criteria
-- The filter conditions might be too restrictive
-- You might want to try a broader search
-
-Would you like to try a different question or see what data is available?"""
+        return f"""No results found for your query.
+        I searched for "{question}" but didn't find any matching records. Would you like to rephrase your question to explore available data?"""
 
     def _format_dataframe(self, df: pd.DataFrame, max_rows: int = 25) -> str:
         """Format DataFrame for LLM consumption"""
