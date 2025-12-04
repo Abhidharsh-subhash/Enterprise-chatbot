@@ -21,6 +21,7 @@ class DataResult(BaseModel):
 
 
 class AskResponse(BaseModel):
+    status_code: int
     success: bool
     answer: str
     query_type: str  # "excel_sql" or "document_rag"

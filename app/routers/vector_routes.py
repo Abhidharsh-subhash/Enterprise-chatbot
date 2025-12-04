@@ -75,6 +75,7 @@ async def ask_question(
             )
 
         return AskResponse(
+            status_code=status.HTTP_200_OK,
             success=result["success"],
             answer=result["answer"],
             query_type=result.get("query_type", "unknown"),
