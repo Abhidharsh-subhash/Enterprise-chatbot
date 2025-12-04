@@ -64,8 +64,6 @@ Query Results ({len(data)} rows):
 
 Please provide a clear, natural language answer that:
 1. Directly answers the user's question
-2. Highlights key findings from the data
-3. Mentions any notable patterns or insights
 """
 
         try:
@@ -98,7 +96,6 @@ But the query failed with error: {error}
 
 Generate a helpful, friendly response that:
 1. Acknowledges the question couldn't be answered
-2. Explains the issue in simple terms (not technical jargon)
 3. Suggests what the user might try instead
 
 Keep it brief and helpful.
