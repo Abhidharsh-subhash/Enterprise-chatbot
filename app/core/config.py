@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     memory_url: str = Field(env="MEMORY_URL")
     vector_database: str = Field(env="VECTOR_DATABASE")
 
+    # SQLite
+    sqlite_database: str = "excel_data.db"
+    sqlite_path: str = "./data"  # Directory for SQLite file
+
     class Config:
         env_file = ".env"
         extra = "ignore"

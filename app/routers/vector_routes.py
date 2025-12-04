@@ -15,6 +15,7 @@ from app.dependencies import get_current_user
 from app.core.logger import logger
 import uuid
 from typing import Dict, Any
+from app.schemas.vector import AskRequest
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -40,3 +41,12 @@ async def upload_file(
         }
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/ask")
+async def ask_question(
+    payload: AskRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Users = Depends(get_current_user),
+):
+    pass
