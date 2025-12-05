@@ -1,7 +1,9 @@
+# sql_generator.py
 from openai import OpenAI
 from typing import List, Dict, Any, Optional, Tuple
 import json
 import re
+from datetime import datetime, timedelta
 
 from app.core.config import settings
 
@@ -27,13 +29,26 @@ SQLITE SPECIFICS:
 - Type conversion: CAST(column AS REAL)
 - Null handling: IFNULL(column, default_value)
 
+**CRITICAL DATE RANGE HANDLING (VERY IMPORTANT):**
+When user asks for data between two dates (e.g., "from 21-10-2025 to 23-11-2025"):
+- BOTH start and end dates should be FULLY INCLUSIVE
+- For datetime/timestamp columns, use this pattern:
+  WHERE DATE(date_column) >= 'start_date' AND DATE(date_column) <= 'end_date'
+  OR
+  WHERE date_column >= 'start_date' AND date_column < 'day_after_end_date'
+- Always convert dates to ISO format: YYYY-MM-DD
+- Example: "from 21-10-2025 to 23-11-2025" should query:
+  WHERE DATE(order_date) >= '2025-10-21' AND DATE(order_date) <= '2025-11-23'
+  OR
+  WHERE order_date >= '2025-10-21' AND order_date < '2025-11-24'
+
 COMMON PATTERNS:
 - Total/Sum: SELECT column, SUM(value) FROM table GROUP BY column
 - Average: SELECT column, AVG(value) FROM table GROUP BY column
 - Count: SELECT column, COUNT(*) FROM table GROUP BY column
 - Filter: SELECT * FROM table WHERE condition
 - Top N: SELECT * FROM table ORDER BY column DESC LIMIT N
-- Date range: WHERE date_column BETWEEN 'start' AND 'end'
+- Date range (INCLUSIVE): WHERE DATE(date_column) BETWEEN 'start' AND 'end'
 """
 
     def __init__(self):
@@ -54,6 +69,9 @@ COMMON PATTERNS:
         Returns:
             Tuple of (sql_query, explanation)
         """
+        # Preprocess question to handle date ranges
+        processed_question = self._preprocess_date_ranges(question)
+
         # Build schema context
         schema_context = self._build_schema_context(schemas)
 
@@ -67,6 +85,9 @@ COMMON PATTERNS:
         if conversation_history:
             history_context = self._build_history_context(conversation_history)
 
+        # Add explicit date handling instruction
+        date_instruction = self._get_date_instruction(processed_question)
+
         user_prompt = f"""
 {schema_context}
 
@@ -74,9 +95,12 @@ COMMON PATTERNS:
 
 {history_context}
 
-User Question: {question}
+{date_instruction}
+
+User Question: {processed_question}
 
 Generate a SQLite query to answer this question. Return ONLY the SQL query.
+IMPORTANT: For date ranges, ensure BOTH start and end dates are FULLY INCLUSIVE.
 """
 
         try:
@@ -91,10 +115,94 @@ Generate a SQLite query to answer this question. Return ONLY the SQL query.
             )
 
             sql = self._clean_sql(response.choices[0].message.content)
+
+            # Post-process SQL to fix date range issues
+            sql = self._fix_date_range_in_sql(sql)
+
             return sql, "Query generated successfully"
 
         except Exception as e:
             return "", f"Error generating SQL: {str(e)}"
+
+    def _preprocess_date_ranges(self, question: str) -> str:
+        """
+        Preprocess question to standardize date formats and add clarity.
+        """
+        # Pattern to match dates in various formats
+        # DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY
+        date_patterns = [
+            (r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", self._convert_date_format),
+        ]
+
+        processed = question
+        for pattern, converter in date_patterns:
+            processed = re.sub(pattern, converter, processed)
+
+        return processed
+
+    def _convert_date_format(self, match) -> str:
+        """Convert date from DD-MM-YYYY to YYYY-MM-DD (ISO format)"""
+        day, month, year = match.groups()
+        try:
+            # Validate it's a real date
+            date_obj = datetime(int(year), int(month), int(day))
+            return date_obj.strftime("%Y-%m-%d")
+        except ValueError:
+            # If invalid date, return original
+            return match.group(0)
+
+    def _get_date_instruction(self, question: str) -> str:
+        """
+        Generate explicit date handling instructions if date range detected.
+        """
+        # Check if question contains date range indicators
+        range_indicators = [
+            r"from\s+\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2}",
+            r"between\s+\d{4}-\d{2}-\d{2}\s+and\s+\d{4}-\d{2}-\d{2}",
+            r"\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2}",
+        ]
+
+        for pattern in range_indicators:
+            if re.search(pattern, question, re.IGNORECASE):
+                return """
+**DATE RANGE INSTRUCTION:**
+This query involves a date range. Ensure the end date is FULLY INCLUSIVE.
+Use one of these approaches:
+1. WHERE DATE(date_column) >= 'start' AND DATE(date_column) <= 'end'
+2. WHERE date_column >= 'start' AND date_column < 'day_after_end'
+DO NOT use simple BETWEEN for datetime columns as it may exclude end date records.
+"""
+
+        return ""
+
+    def _fix_date_range_in_sql(self, sql: str) -> str:
+        """
+        Post-process SQL to fix potential date range issues.
+        Converts BETWEEN clauses to inclusive range queries.
+        """
+        # Pattern to find BETWEEN date clauses
+        between_pattern = (
+            r"(\w+)\s+BETWEEN\s+'(\d{4}-\d{2}-\d{2})'\s+AND\s+'(\d{4}-\d{2}-\d{2})'"
+        )
+
+        def replace_between(match):
+            column = match.group(1)
+            start_date = match.group(2)
+            end_date = match.group(3)
+
+            # Calculate day after end date for inclusive range
+            try:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                next_day = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+                # Use DATE() function for safe comparison
+                return f"DATE({column}) >= '{start_date}' AND DATE({column}) <= '{end_date}'"
+            except:
+                return match.group(0)
+
+        fixed_sql = re.sub(between_pattern, replace_between, sql, flags=re.IGNORECASE)
+
+        return fixed_sql
 
     def fix_sql_error(
         self,
@@ -124,6 +232,7 @@ Please fix the SQL query. Common issues to check:
 4. Missing GROUP BY clause
 5. Invalid function names
 6. Incorrect data types in comparisons
+7. Date range issues - ensure end dates are inclusive
 
 Return ONLY the corrected SQL query, nothing else.
 """
@@ -139,7 +248,8 @@ Return ONLY the corrected SQL query, nothing else.
                 max_tokens=1000,
             )
 
-            return self._clean_sql(response.choices[0].message.content)
+            sql = self._clean_sql(response.choices[0].message.content)
+            return self._fix_date_range_in_sql(sql)
 
         except Exception as e:
             return ""
@@ -159,9 +269,15 @@ Return ONLY the corrected SQL query, nothing else.
                     parts.append("Columns:")
                     for col in schema["columns"]:
                         if isinstance(col, dict):
-                            parts.append(
-                                f"  - {col.get('name')} ({col.get('type', 'TEXT')})"
-                            )
+                            col_type = col.get("type", "TEXT")
+                            col_name = col.get("name")
+                            # Add hint for date columns
+                            if "date" in col_name.lower() or "time" in col_name.lower():
+                                parts.append(
+                                    f"  - {col_name} ({col_type}) [DATE/DATETIME COLUMN]"
+                                )
+                            else:
+                                parts.append(f"  - {col_name} ({col_type})")
                         else:
                             parts.append(f"  - {col}")
             parts.append("")
