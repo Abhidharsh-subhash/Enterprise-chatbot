@@ -299,7 +299,12 @@ class QueryService:
             temperature=temperature,
         )
 
+        # Enhanced logging
+        print(f"\n{'='*60}")
+        print(f"Question: {question}")
         print(f"Generated SQL: {sql}")
+        print(f"Column Context: {column_context}")
+        print(f"{'='*60}\n")
 
         if not sql:
             return {

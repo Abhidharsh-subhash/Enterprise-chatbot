@@ -1,4 +1,4 @@
-# sql_generator.py - Updated version
+# sql_generator.py - Complete updated version
 from openai import OpenAI
 from typing import List, Dict, Any, Optional, Tuple
 import json
@@ -16,34 +16,44 @@ Your task is to convert natural language questions into accurate SQL queries.
 
 CRITICAL RULES:
 1. Use ONLY the exact column names from the provided schema
-2. **CRITICAL: Match column values EXACTLY as shown in the "CATEGORICAL COLUMNS" section**
-3. Use LIKE with wildcards for partial matching ONLY if exact match not found
-4. For case-insensitive matching: LOWER(column) = LOWER('value') or COLLATE NOCASE
-5. Always include proper GROUP BY when using aggregations
-6. Use LIMIT for large results unless user asks for all data
-7. Return ONLY the SQL query - no markdown, no explanations
+2. **Match column values EXACTLY as shown in "CATEGORICAL COLUMNS" section**
+3. SQLite syntax only
+4. Always include proper GROUP BY when using aggregations
+5. Return ONLY the SQL query - no markdown, no explanations, no code blocks
 
-**DATE COLUMN SELECTION (VERY IMPORTANT):**
-When user asks about "when something happened", use the semantic meaning:
-- "opted for", "ordered", "placed", "created", "initiated" → use order_created_date or created_at
-- "completed", "closed", "finished", "delivered" → use order_closed_date or completed_at
-- "paid", "payment made" → use payment_date
+**NUMERIC CONDITION INTERPRETATION (VERY IMPORTANT):**
+When user asks if someone "used", "applied", "had", "got" something:
+- "used promo discount" → WHERE promo_discount > 0
+- "used coupon" → WHERE coupon_discount_amount > 0
+- "had express delivery" → WHERE express_cost > 0  
+- "got special discount" → WHERE special_discount > 0
+- "paid tax" → WHERE tax_amount > 0
 
-**VALUE MATCHING RULES:**
-1. If user says "premium ironing" and values show "Premium Ironing Service", use the EXACT value from the list
-2. If user says partial term, find the closest match from available values
-3. Use LIKE '%term%' only as last resort when no close match exists
+NULL and ZERO are different:
+- NULL means no value recorded
+- 0 means no discount was applied
+- To find records that USED something: column > 0 (not just IS NOT NULL)
 
-**DATE RANGE HANDLING:**
-- BOTH start and end dates should be FULLY INCLUSIVE
-- For datetime columns: WHERE DATE(date_column) >= 'start' AND DATE(date_column) <= 'end'
-- Convert dates to ISO format: YYYY-MM-DD
+**DATE COLUMN SELECTION:**
+When user asks about when something happened, choose the right date column:
+- "placed on", "created on", "ordered on", "opted for on" → order_created_date
+- "closed on", "completed on", "delivered on" → order_closed_date
+- "paid on", "payment on" → payment_date
+
+**DATE HANDLING:**
+- Convert dates to YYYY-MM-DD format
+- For single date: DATE(column) = 'YYYY-MM-DD'
+- For date range: DATE(column) >= 'start' AND DATE(column) <= 'end'
+- Both start and end dates are INCLUSIVE
+
+**VALUE MATCHING:**
+- Use EXACT values from CATEGORICAL COLUMNS list
+- For partial matches: LIKE '%term%' COLLATE NOCASE
 
 SQLITE SPECIFICS:
-- String concatenation: ||
-- Date functions: DATE(), strftime()
-- Type conversion: CAST(column AS REAL)
-- Null handling: IFNULL(column, default_value)
+- IFNULL(column, 0) for null handling
+- DATE() function for date extraction
+- COLLATE NOCASE for case-insensitive comparison
 """
 
     def __init__(self):
@@ -55,44 +65,29 @@ SQLITE SPECIFICS:
         question: str,
         schemas: List[Dict[str, Any]],
         sample_data: Dict[str, str] = None,
-        column_context: Dict[str, Any] = None,  # NEW PARAMETER
+        column_context: Dict[str, Any] = None,
         conversation_history: List[Dict] = None,
         temperature: float = 0.1,
     ) -> Tuple[str, str]:
-        """
-        Generate SQL from natural language question.
+        """Generate SQL from natural language question."""
 
-        Args:
-            question: User's natural language question
-            schemas: Table schemas
-            sample_data: Sample rows from tables
-            column_context: Rich context about columns (distinct values, semantics)
-            conversation_history: Previous conversation for context
-            temperature: LLM temperature
-
-        Returns:
-            Tuple of (sql_query, explanation)
-        """
-        # Preprocess question to handle date formats
+        # Preprocess question
         processed_question = self._preprocess_date_ranges(question)
 
         # Analyze question intent
         intent_hints = self._analyze_question_intent(processed_question)
 
-        # Build schema context
+        # Build contexts
         schema_context = self._build_schema_context(schemas)
 
-        # Build column context (NEW)
         column_context_str = ""
         if column_context:
             column_context_str = self._format_column_context(column_context)
 
-        # Build sample data context
         sample_context = ""
         if sample_data:
             sample_context = self._build_sample_context(sample_data)
 
-        # Build conversation context
         history_context = ""
         if conversation_history:
             history_context = self._build_history_context(conversation_history)
@@ -110,12 +105,12 @@ SQLITE SPECIFICS:
 
 User Question: {processed_question}
 
-**IMPORTANT INSTRUCTIONS:**
-1. For date filtering, use the date column that matches the USER'S INTENT (see DATE COLUMN SELECTION rules)
-2. For value filtering, use EXACT values from the CATEGORICAL COLUMNS list above
-3. If user mentions "premium ironing", find the exact matching value from the service column values
+**REMINDERS:**
+1. For "used promo discount" → use WHERE promo_discount > 0 (not IS NOT NULL)
+2. For date filtering on "placed/ordered/created" → use order_created_date
+3. Select ALL relevant columns so the user gets complete information
 
-Generate a SQLite query to answer this question. Return ONLY the SQL query.
+Generate a SQLite query. Return ONLY the SQL query.
 """
 
         try:
@@ -131,6 +126,7 @@ Generate a SQLite query to answer this question. Return ONLY the SQL query.
 
             sql = self._clean_sql(response.choices[0].message.content)
             sql = self._fix_date_range_in_sql(sql)
+            sql = self._fix_numeric_conditions(sql)
 
             return sql, "Query generated successfully"
 
@@ -142,84 +138,97 @@ Generate a SQLite query to answer this question. Return ONLY the SQL query.
         hints = []
         question_lower = question.lower()
 
-        # Date intent analysis
-        date_created_indicators = [
-            "opted for",
-            "ordered",
+        # Date intent
+        date_created_words = [
             "placed",
             "created",
-            "initiated",
-            "signed up",
-            "registered",
-            "subscribed",
+            "ordered",
+            "opted",
             "booked",
             "requested",
         ]
-        date_closed_indicators = [
-            "completed",
-            "closed",
-            "finished",
-            "delivered",
-            "fulfilled",
-            "done",
-            "ended",
-            "resolved",
+        date_closed_words = ["closed", "completed", "delivered", "finished"]
+        date_paid_words = ["paid", "payment"]
+
+        for word in date_created_words:
+            if word in question_lower:
+                hints.append(
+                    f"**DATE HINT**: '{word}' refers to ORDER CREATION → use order_created_date"
+                )
+                break
+
+        for word in date_closed_words:
+            if word in question_lower:
+                hints.append(
+                    f"**DATE HINT**: '{word}' refers to ORDER COMPLETION → use order_closed_date"
+                )
+                break
+
+        for word in date_paid_words:
+            if word in question_lower:
+                hints.append(
+                    f"**DATE HINT**: '{word}' refers to PAYMENT → use payment_date"
+                )
+                break
+
+        # Numeric usage intent
+        usage_patterns = [
+            ("promo", "promo_discount", "promo_discount > 0"),
+            ("coupon", "coupon_discount", "coupon_discount_amount > 0"),
+            ("express", "express_cost", "express_cost > 0"),
+            ("special discount", "special_discount", "special_discount > 0"),
         ]
-        date_paid_indicators = ["paid", "payment", "settled", "transaction"]
 
-        for indicator in date_created_indicators:
-            if indicator in question_lower:
+        for keyword, column, condition in usage_patterns:
+            if keyword in question_lower and (
+                "used" in question_lower
+                or "applied" in question_lower
+                or "had" in question_lower
+                or "got" in question_lower
+            ):
                 hints.append(
-                    f"**DATE HINT**: User asked about '{indicator}' which typically refers to ORDER CREATION date (order_created_date, created_at, etc.)"
+                    f"**NUMERIC HINT**: User asking about using '{keyword}' → use WHERE {condition}"
                 )
-                break
-
-        for indicator in date_closed_indicators:
-            if indicator in question_lower:
-                hints.append(
-                    f"**DATE HINT**: User asked about '{indicator}' which typically refers to ORDER COMPLETION date (order_closed_date, completed_at, etc.)"
-                )
-                break
-
-        for indicator in date_paid_indicators:
-            if indicator in question_lower:
-                hints.append(
-                    f"**DATE HINT**: User asked about '{indicator}' which typically refers to PAYMENT date (payment_date, paid_at, etc.)"
-                )
-                break
-
-        # Service/product intent
-        if "premium" in question_lower:
-            hints.append(
-                "**VALUE HINT**: User mentioned 'premium' - look for exact values containing 'Premium' in the categorical columns"
-            )
-
-        if "service" in question_lower:
-            hints.append(
-                "**VALUE HINT**: User mentioned 'service' - filter on the service/service_type column using exact values from the list"
-            )
 
         if hints:
             return "\n**INTENT ANALYSIS:**\n" + "\n".join(hints)
 
         return ""
 
+    def _fix_numeric_conditions(self, sql: str) -> str:
+        """Fix common numeric condition issues"""
+        # Replace IS NOT NULL with > 0 for discount/cost columns
+        patterns = [
+            (r"promo_discount\s+IS\s+NOT\s+NULL", "IFNULL(promo_discount, 0) > 0"),
+            (
+                r"coupon_discount_amount\s+IS\s+NOT\s+NULL",
+                "IFNULL(coupon_discount_amount, 0) > 0",
+            ),
+            (r"express_cost\s+IS\s+NOT\s+NULL", "IFNULL(express_cost, 0) > 0"),
+            (r"special_discount\s+IS\s+NOT\s+NULL", "IFNULL(special_discount, 0) > 0"),
+            # Also handle != 0 or <> 0 patterns
+            (r"promo_discount\s*!=\s*0", "IFNULL(promo_discount, 0) > 0"),
+            (r"promo_discount\s*<>\s*0", "IFNULL(promo_discount, 0) > 0"),
+        ]
+
+        fixed_sql = sql
+        for pattern, replacement in patterns:
+            fixed_sql = re.sub(pattern, replacement, fixed_sql, flags=re.IGNORECASE)
+
+        return fixed_sql
+
     def _format_column_context(self, context: Dict[str, Any]) -> str:
         """Format column context for the prompt"""
-        parts = ["**COLUMN CONTEXT (USE THIS FOR ACCURATE QUERIES):**"]
+        parts = ["**COLUMN CONTEXT:**"]
         parts.append("=" * 50)
 
-        # Date columns with semantic meaning
         if context.get("date_columns"):
-            parts.append("\n**DATE COLUMNS:**")
+            parts.append("\n**DATE COLUMNS (choose based on user's intent):**")
             for col_name, info in context["date_columns"].items():
                 parts.append(f"  • {col_name}: {info['semantic']}")
 
-        # Categorical columns with exact values
         if context.get("categorical_columns"):
-            parts.append(
-                "\n**CATEGORICAL COLUMNS (use these EXACT values in queries):**"
-            )
+            parts.append("\n**CATEGORICAL COLUMNS (use EXACT values):**")
             for col_name, info in context["categorical_columns"].items():
                 values = info["values"]
                 if len(values) <= 10:
@@ -234,24 +243,51 @@ Generate a SQLite query to answer this question. Return ONLY the SQL query.
 
     def _preprocess_date_ranges(self, question: str) -> str:
         """Preprocess question to standardize date formats"""
-        date_patterns = [
-            (r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", self._convert_date_format),
-        ]
+
+        # Pattern for DD-MM-YYYY, DD/MM/YYYY
+        def convert_date(match):
+            day, month, year = match.groups()
+            try:
+                date_obj = datetime(int(year), int(month), int(day))
+                return date_obj.strftime("%Y-%m-%d")
+            except ValueError:
+                return match.group(0)
+
+        # Also handle "22 nov 2025" format
+        month_names = {
+            "jan": "01",
+            "feb": "02",
+            "mar": "03",
+            "apr": "04",
+            "may": "05",
+            "jun": "06",
+            "jul": "07",
+            "aug": "08",
+            "sep": "09",
+            "oct": "10",
+            "nov": "11",
+            "dec": "12",
+        }
 
         processed = question
-        for pattern, converter in date_patterns:
-            processed = re.sub(pattern, converter, processed)
+
+        # DD-MM-YYYY or DD/MM/YYYY
+        processed = re.sub(
+            r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", convert_date, processed
+        )
+
+        # DD Month YYYY (e.g., 22 nov 2025)
+        for month_name, month_num in month_names.items():
+            pattern = rf"(\d{{1,2}})\s*{month_name}[a-z]*\s*(\d{{4}})"
+
+            def replace_month(match, mn=month_num):
+                day = match.group(1).zfill(2)
+                year = match.group(2)
+                return f"{year}-{mn}-{day}"
+
+            processed = re.sub(pattern, replace_month, processed, flags=re.IGNORECASE)
 
         return processed
-
-    def _convert_date_format(self, match) -> str:
-        """Convert date from DD-MM-YYYY to YYYY-MM-DD"""
-        day, month, year = match.groups()
-        try:
-            date_obj = datetime(int(year), int(month), int(day))
-            return date_obj.strftime("%Y-%m-%d")
-        except ValueError:
-            return match.group(0)
 
     def _fix_date_range_in_sql(self, sql: str) -> str:
         """Post-process SQL to fix date range issues"""
@@ -274,7 +310,7 @@ Generate a SQLite query to answer this question. Return ONLY the SQL query.
         original_sql: str,
         error_message: str,
         schema_context: str,
-        column_context: str = "",  # NEW
+        column_context: str = "",
         temperature: float = 0.1,
     ) -> str:
         """Attempt to fix SQL query based on error message"""
@@ -293,14 +329,7 @@ SCHEMA:
 
 {column_context}
 
-Please fix the SQL query. Common issues:
-1. Column name spelling (must match schema exactly)
-2. Value spelling (must match exact values from categorical columns)
-3. Wrong date column for the user's intent
-4. Missing quotes around string values
-5. Missing GROUP BY clause
-
-Return ONLY the corrected SQL query.
+Please fix the SQL query. Return ONLY the corrected SQL query.
 """
 
         try:
@@ -315,7 +344,9 @@ Return ONLY the corrected SQL query.
             )
 
             sql = self._clean_sql(response.choices[0].message.content)
-            return self._fix_date_range_in_sql(sql)
+            sql = self._fix_date_range_in_sql(sql)
+            sql = self._fix_numeric_conditions(sql)
+            return sql
 
         except Exception:
             return ""
@@ -334,9 +365,9 @@ Return ONLY the corrected SQL query.
                     parts.append("Columns:")
                     for col in schema["columns"]:
                         if isinstance(col, dict):
-                            col_type = col.get("type", "TEXT")
-                            col_name = col.get("name")
-                            parts.append(f"  - {col_name} ({col_type})")
+                            parts.append(
+                                f"  - {col.get('name')} ({col.get('type', 'TEXT')})"
+                            )
                         else:
                             parts.append(f"  - {col}")
             parts.append("")
@@ -345,7 +376,7 @@ Return ONLY the corrected SQL query.
 
     def _build_sample_context(self, sample_data: Dict[str, str]) -> str:
         """Build sample data context"""
-        parts = ["**SAMPLE DATA PREVIEW:**"]
+        parts = ["**SAMPLE DATA:**"]
         parts.append("-" * 30)
 
         for table_name, data in sample_data.items():
@@ -360,8 +391,6 @@ Return ONLY the corrected SQL query.
             return ""
 
         parts = ["**PREVIOUS CONVERSATION:**"]
-        parts.append("-" * 30)
-
         recent = history[-6:]
         for msg in recent:
             role = msg.get("role", "user").upper()

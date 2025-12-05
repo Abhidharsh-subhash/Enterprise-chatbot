@@ -62,7 +62,7 @@ async def ask_question(
             session_id=payload.session_id,
             top_k=payload.top_k,
             temperature=payload.temperature,
-            show_sql=payload.show_sql,
+            show_sql=True,  # Force show SQL for debugging
         )
 
         # Build response
