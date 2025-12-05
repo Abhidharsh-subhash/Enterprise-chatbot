@@ -1,4 +1,4 @@
-# sql_generator.py
+# sql_generator.py - Updated version
 from openai import OpenAI
 from typing import List, Dict, Any, Optional, Tuple
 import json
@@ -16,39 +16,34 @@ Your task is to convert natural language questions into accurate SQL queries.
 
 CRITICAL RULES:
 1. Use ONLY the exact column names from the provided schema
-2. SQLite syntax - use standard SQL
-3. For case-insensitive string matching: column LIKE '%value%' COLLATE NOCASE
-4. Always include proper GROUP BY when using aggregations with other columns
-5. Use LIMIT for large results unless user asks for all data
-6. Handle NULL values with IFNULL() or COALESCE()
-7. Return ONLY the SQL query - no markdown, no explanations, no code blocks
+2. **CRITICAL: Match column values EXACTLY as shown in the "CATEGORICAL COLUMNS" section**
+3. Use LIKE with wildcards for partial matching ONLY if exact match not found
+4. For case-insensitive matching: LOWER(column) = LOWER('value') or COLLATE NOCASE
+5. Always include proper GROUP BY when using aggregations
+6. Use LIMIT for large results unless user asks for all data
+7. Return ONLY the SQL query - no markdown, no explanations
+
+**DATE COLUMN SELECTION (VERY IMPORTANT):**
+When user asks about "when something happened", use the semantic meaning:
+- "opted for", "ordered", "placed", "created", "initiated" → use order_created_date or created_at
+- "completed", "closed", "finished", "delivered" → use order_closed_date or completed_at
+- "paid", "payment made" → use payment_date
+
+**VALUE MATCHING RULES:**
+1. If user says "premium ironing" and values show "Premium Ironing Service", use the EXACT value from the list
+2. If user says partial term, find the closest match from available values
+3. Use LIKE '%term%' only as last resort when no close match exists
+
+**DATE RANGE HANDLING:**
+- BOTH start and end dates should be FULLY INCLUSIVE
+- For datetime columns: WHERE DATE(date_column) >= 'start' AND DATE(date_column) <= 'end'
+- Convert dates to ISO format: YYYY-MM-DD
 
 SQLITE SPECIFICS:
 - String concatenation: ||
-- Date functions: DATE(), TIME(), DATETIME(), strftime()
+- Date functions: DATE(), strftime()
 - Type conversion: CAST(column AS REAL)
 - Null handling: IFNULL(column, default_value)
-
-**CRITICAL DATE RANGE HANDLING (VERY IMPORTANT):**
-When user asks for data between two dates (e.g., "from 21-10-2025 to 23-11-2025"):
-- BOTH start and end dates should be FULLY INCLUSIVE
-- For datetime/timestamp columns, use this pattern:
-  WHERE DATE(date_column) >= 'start_date' AND DATE(date_column) <= 'end_date'
-  OR
-  WHERE date_column >= 'start_date' AND date_column < 'day_after_end_date'
-- Always convert dates to ISO format: YYYY-MM-DD
-- Example: "from 21-10-2025 to 23-11-2025" should query:
-  WHERE DATE(order_date) >= '2025-10-21' AND DATE(order_date) <= '2025-11-23'
-  OR
-  WHERE order_date >= '2025-10-21' AND order_date < '2025-11-24'
-
-COMMON PATTERNS:
-- Total/Sum: SELECT column, SUM(value) FROM table GROUP BY column
-- Average: SELECT column, AVG(value) FROM table GROUP BY column
-- Count: SELECT column, COUNT(*) FROM table GROUP BY column
-- Filter: SELECT * FROM table WHERE condition
-- Top N: SELECT * FROM table ORDER BY column DESC LIMIT N
-- Date range (INCLUSIVE): WHERE DATE(date_column) BETWEEN 'start' AND 'end'
 """
 
     def __init__(self):
@@ -60,47 +55,67 @@ COMMON PATTERNS:
         question: str,
         schemas: List[Dict[str, Any]],
         sample_data: Dict[str, str] = None,
+        column_context: Dict[str, Any] = None,  # NEW PARAMETER
         conversation_history: List[Dict] = None,
         temperature: float = 0.1,
     ) -> Tuple[str, str]:
         """
         Generate SQL from natural language question.
 
+        Args:
+            question: User's natural language question
+            schemas: Table schemas
+            sample_data: Sample rows from tables
+            column_context: Rich context about columns (distinct values, semantics)
+            conversation_history: Previous conversation for context
+            temperature: LLM temperature
+
         Returns:
             Tuple of (sql_query, explanation)
         """
-        # Preprocess question to handle date ranges
+        # Preprocess question to handle date formats
         processed_question = self._preprocess_date_ranges(question)
+
+        # Analyze question intent
+        intent_hints = self._analyze_question_intent(processed_question)
 
         # Build schema context
         schema_context = self._build_schema_context(schemas)
+
+        # Build column context (NEW)
+        column_context_str = ""
+        if column_context:
+            column_context_str = self._format_column_context(column_context)
 
         # Build sample data context
         sample_context = ""
         if sample_data:
             sample_context = self._build_sample_context(sample_data)
 
-        # Build conversation context for follow-ups
+        # Build conversation context
         history_context = ""
         if conversation_history:
             history_context = self._build_history_context(conversation_history)
 
-        # Add explicit date handling instruction
-        date_instruction = self._get_date_instruction(processed_question)
-
         user_prompt = f"""
 {schema_context}
+
+{column_context_str}
 
 {sample_context}
 
 {history_context}
 
-{date_instruction}
+{intent_hints}
 
 User Question: {processed_question}
 
+**IMPORTANT INSTRUCTIONS:**
+1. For date filtering, use the date column that matches the USER'S INTENT (see DATE COLUMN SELECTION rules)
+2. For value filtering, use EXACT values from the CATEGORICAL COLUMNS list above
+3. If user mentions "premium ironing", find the exact matching value from the service column values
+
 Generate a SQLite query to answer this question. Return ONLY the SQL query.
-IMPORTANT: For date ranges, ensure BOTH start and end dates are FULLY INCLUSIVE.
 """
 
         try:
@@ -115,8 +130,6 @@ IMPORTANT: For date ranges, ensure BOTH start and end dates are FULLY INCLUSIVE.
             )
 
             sql = self._clean_sql(response.choices[0].message.content)
-
-            # Post-process SQL to fix date range issues
             sql = self._fix_date_range_in_sql(sql)
 
             return sql, "Query generated successfully"
@@ -124,12 +137,103 @@ IMPORTANT: For date ranges, ensure BOTH start and end dates are FULLY INCLUSIVE.
         except Exception as e:
             return "", f"Error generating SQL: {str(e)}"
 
+    def _analyze_question_intent(self, question: str) -> str:
+        """Analyze question to provide intent hints"""
+        hints = []
+        question_lower = question.lower()
+
+        # Date intent analysis
+        date_created_indicators = [
+            "opted for",
+            "ordered",
+            "placed",
+            "created",
+            "initiated",
+            "signed up",
+            "registered",
+            "subscribed",
+            "booked",
+            "requested",
+        ]
+        date_closed_indicators = [
+            "completed",
+            "closed",
+            "finished",
+            "delivered",
+            "fulfilled",
+            "done",
+            "ended",
+            "resolved",
+        ]
+        date_paid_indicators = ["paid", "payment", "settled", "transaction"]
+
+        for indicator in date_created_indicators:
+            if indicator in question_lower:
+                hints.append(
+                    f"**DATE HINT**: User asked about '{indicator}' which typically refers to ORDER CREATION date (order_created_date, created_at, etc.)"
+                )
+                break
+
+        for indicator in date_closed_indicators:
+            if indicator in question_lower:
+                hints.append(
+                    f"**DATE HINT**: User asked about '{indicator}' which typically refers to ORDER COMPLETION date (order_closed_date, completed_at, etc.)"
+                )
+                break
+
+        for indicator in date_paid_indicators:
+            if indicator in question_lower:
+                hints.append(
+                    f"**DATE HINT**: User asked about '{indicator}' which typically refers to PAYMENT date (payment_date, paid_at, etc.)"
+                )
+                break
+
+        # Service/product intent
+        if "premium" in question_lower:
+            hints.append(
+                "**VALUE HINT**: User mentioned 'premium' - look for exact values containing 'Premium' in the categorical columns"
+            )
+
+        if "service" in question_lower:
+            hints.append(
+                "**VALUE HINT**: User mentioned 'service' - filter on the service/service_type column using exact values from the list"
+            )
+
+        if hints:
+            return "\n**INTENT ANALYSIS:**\n" + "\n".join(hints)
+
+        return ""
+
+    def _format_column_context(self, context: Dict[str, Any]) -> str:
+        """Format column context for the prompt"""
+        parts = ["**COLUMN CONTEXT (USE THIS FOR ACCURATE QUERIES):**"]
+        parts.append("=" * 50)
+
+        # Date columns with semantic meaning
+        if context.get("date_columns"):
+            parts.append("\n**DATE COLUMNS:**")
+            for col_name, info in context["date_columns"].items():
+                parts.append(f"  • {col_name}: {info['semantic']}")
+
+        # Categorical columns with exact values
+        if context.get("categorical_columns"):
+            parts.append(
+                "\n**CATEGORICAL COLUMNS (use these EXACT values in queries):**"
+            )
+            for col_name, info in context["categorical_columns"].items():
+                values = info["values"]
+                if len(values) <= 10:
+                    values_str = ", ".join([f"'{v}'" for v in values])
+                else:
+                    values_str = ", ".join([f"'{v}'" for v in values[:10]])
+                    values_str += f" ... (+{len(values) - 10} more)"
+                parts.append(f"  • {col_name}: [{values_str}]")
+
+        parts.append("=" * 50)
+        return "\n".join(parts)
+
     def _preprocess_date_ranges(self, question: str) -> str:
-        """
-        Preprocess question to standardize date formats and add clarity.
-        """
-        # Pattern to match dates in various formats
-        # DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY
+        """Preprocess question to standardize date formats"""
         date_patterns = [
             (r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", self._convert_date_format),
         ]
@@ -141,46 +245,16 @@ IMPORTANT: For date ranges, ensure BOTH start and end dates are FULLY INCLUSIVE.
         return processed
 
     def _convert_date_format(self, match) -> str:
-        """Convert date from DD-MM-YYYY to YYYY-MM-DD (ISO format)"""
+        """Convert date from DD-MM-YYYY to YYYY-MM-DD"""
         day, month, year = match.groups()
         try:
-            # Validate it's a real date
             date_obj = datetime(int(year), int(month), int(day))
             return date_obj.strftime("%Y-%m-%d")
         except ValueError:
-            # If invalid date, return original
             return match.group(0)
 
-    def _get_date_instruction(self, question: str) -> str:
-        """
-        Generate explicit date handling instructions if date range detected.
-        """
-        # Check if question contains date range indicators
-        range_indicators = [
-            r"from\s+\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2}",
-            r"between\s+\d{4}-\d{2}-\d{2}\s+and\s+\d{4}-\d{2}-\d{2}",
-            r"\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2}",
-        ]
-
-        for pattern in range_indicators:
-            if re.search(pattern, question, re.IGNORECASE):
-                return """
-**DATE RANGE INSTRUCTION:**
-This query involves a date range. Ensure the end date is FULLY INCLUSIVE.
-Use one of these approaches:
-1. WHERE DATE(date_column) >= 'start' AND DATE(date_column) <= 'end'
-2. WHERE date_column >= 'start' AND date_column < 'day_after_end'
-DO NOT use simple BETWEEN for datetime columns as it may exclude end date records.
-"""
-
-        return ""
-
     def _fix_date_range_in_sql(self, sql: str) -> str:
-        """
-        Post-process SQL to fix potential date range issues.
-        Converts BETWEEN clauses to inclusive range queries.
-        """
-        # Pattern to find BETWEEN date clauses
+        """Post-process SQL to fix date range issues"""
         between_pattern = (
             r"(\w+)\s+BETWEEN\s+'(\d{4}-\d{2}-\d{2})'\s+AND\s+'(\d{4}-\d{2}-\d{2})'"
         )
@@ -189,26 +263,18 @@ DO NOT use simple BETWEEN for datetime columns as it may exclude end date record
             column = match.group(1)
             start_date = match.group(2)
             end_date = match.group(3)
+            return (
+                f"DATE({column}) >= '{start_date}' AND DATE({column}) <= '{end_date}'"
+            )
 
-            # Calculate day after end date for inclusive range
-            try:
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                next_day = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-
-                # Use DATE() function for safe comparison
-                return f"DATE({column}) >= '{start_date}' AND DATE({column}) <= '{end_date}'"
-            except:
-                return match.group(0)
-
-        fixed_sql = re.sub(between_pattern, replace_between, sql, flags=re.IGNORECASE)
-
-        return fixed_sql
+        return re.sub(between_pattern, replace_between, sql, flags=re.IGNORECASE)
 
     def fix_sql_error(
         self,
         original_sql: str,
         error_message: str,
         schema_context: str,
+        column_context: str = "",  # NEW
         temperature: float = 0.1,
     ) -> str:
         """Attempt to fix SQL query based on error message"""
@@ -225,16 +291,16 @@ ERROR MESSAGE:
 SCHEMA:
 {schema_context}
 
-Please fix the SQL query. Common issues to check:
-1. Column name spelling (must match schema exactly)
-2. Table name spelling
-3. Missing quotes around string values
-4. Missing GROUP BY clause
-5. Invalid function names
-6. Incorrect data types in comparisons
-7. Date range issues - ensure end dates are inclusive
+{column_context}
 
-Return ONLY the corrected SQL query, nothing else.
+Please fix the SQL query. Common issues:
+1. Column name spelling (must match schema exactly)
+2. Value spelling (must match exact values from categorical columns)
+3. Wrong date column for the user's intent
+4. Missing quotes around string values
+5. Missing GROUP BY clause
+
+Return ONLY the corrected SQL query.
 """
 
         try:
@@ -251,19 +317,18 @@ Return ONLY the corrected SQL query, nothing else.
             sql = self._clean_sql(response.choices[0].message.content)
             return self._fix_date_range_in_sql(sql)
 
-        except Exception as e:
+        except Exception:
             return ""
 
     def _build_schema_context(self, schemas: List[Dict[str, Any]]) -> str:
         """Build schema context for prompt"""
-        parts = ["AVAILABLE TABLES AND SCHEMAS:"]
+        parts = ["**AVAILABLE TABLES AND SCHEMAS:**"]
         parts.append("=" * 50)
 
         for schema in schemas:
             if "prompt_text" in schema:
                 parts.append(schema["prompt_text"])
             else:
-                # Build from schema info
                 parts.append(f"\nTable: {schema.get('table_name', 'unknown')}")
                 if "columns" in schema:
                     parts.append("Columns:")
@@ -271,13 +336,7 @@ Return ONLY the corrected SQL query, nothing else.
                         if isinstance(col, dict):
                             col_type = col.get("type", "TEXT")
                             col_name = col.get("name")
-                            # Add hint for date columns
-                            if "date" in col_name.lower() or "time" in col_name.lower():
-                                parts.append(
-                                    f"  - {col_name} ({col_type}) [DATE/DATETIME COLUMN]"
-                                )
-                            else:
-                                parts.append(f"  - {col_name} ({col_type})")
+                            parts.append(f"  - {col_name} ({col_type})")
                         else:
                             parts.append(f"  - {col}")
             parts.append("")
@@ -286,7 +345,7 @@ Return ONLY the corrected SQL query, nothing else.
 
     def _build_sample_context(self, sample_data: Dict[str, str]) -> str:
         """Build sample data context"""
-        parts = ["SAMPLE DATA PREVIEW:"]
+        parts = ["**SAMPLE DATA PREVIEW:**"]
         parts.append("-" * 30)
 
         for table_name, data in sample_data.items():
@@ -296,36 +355,27 @@ Return ONLY the corrected SQL query, nothing else.
         return "\n".join(parts)
 
     def _build_history_context(self, history: List[Dict]) -> str:
-        """Build conversation history context for follow-up questions"""
+        """Build conversation history context"""
         if not history:
             return ""
 
-        parts = ["PREVIOUS CONVERSATION (for context):"]
+        parts = ["**PREVIOUS CONVERSATION:**"]
         parts.append("-" * 30)
 
-        # Only include last few exchanges
-        recent = history[-6:]  # Last 3 exchanges
-
+        recent = history[-6:]
         for msg in recent:
             role = msg.get("role", "user").upper()
-            content = msg.get("content", "")[:500]  # Limit length
+            content = msg.get("content", "")[:500]
             parts.append(f"{role}: {content}")
 
-        parts.append("-" * 30)
         return "\n".join(parts)
 
     def _clean_sql(self, response: str) -> str:
         """Clean SQL from LLM response"""
-        # Remove markdown code blocks
         response = re.sub(r"```sql\s*", "", response, flags=re.IGNORECASE)
         response = re.sub(r"```\s*", "", response)
-
-        # Remove any leading/trailing whitespace
         sql = response.strip()
-
-        # Remove trailing semicolon (we'll add if needed)
         sql = sql.rstrip(";")
-
         return sql
 
 

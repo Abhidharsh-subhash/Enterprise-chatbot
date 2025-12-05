@@ -11,6 +11,132 @@ from app.services.session_manager import session_manager
 from app.core.config import settings
 
 
+# Inline Column Analyzer to avoid import issues
+class ColumnAnalyzer:
+    """Analyze columns to provide context for SQL generation"""
+
+    CATEGORICAL_KEYWORDS = [
+        "service",
+        "type",
+        "status",
+        "category",
+        "method",
+        "mode",
+        "payment",
+        "level",
+        "tier",
+        "plan",
+        "grade",
+        "priority",
+    ]
+
+    DATE_SEMANTICS = {
+        "created": "when the order/record was CREATED or PLACED by customer",
+        "placed": "when the order was PLACED by customer",
+        "ordered": "when the order was PLACED by customer",
+        "closed": "when the order was COMPLETED/CLOSED/DELIVERED",
+        "completed": "when the order was COMPLETED",
+        "delivered": "when the order was DELIVERED",
+        "paid": "when the PAYMENT was made",
+        "payment": "when the PAYMENT was made",
+    }
+
+    def get_column_context(self, table_name: str, columns: list, user_id: str) -> dict:
+        """Get distinct values for categorical columns and semantics for date columns"""
+
+        context = {
+            "categorical_columns": {},
+            "date_columns": {},
+            "numeric_columns": [],
+            "text_columns": [],
+        }
+
+        for col in columns:
+            col_name = col.get("name", col) if isinstance(col, dict) else col
+            col_type = col.get("type", "TEXT") if isinstance(col, dict) else "TEXT"
+            col_lower = col_name.lower()
+
+            # Identify date columns with semantic meaning
+            if any(kw in col_lower for kw in ["date", "time", "_at", "_on"]):
+                semantic = self._get_date_semantic(col_name)
+                context["date_columns"][col_name] = {
+                    "semantic": semantic,
+                    "type": col_type,
+                }
+
+            # Get distinct values for categorical columns
+            elif any(kw in col_lower for kw in self.CATEGORICAL_KEYWORDS):
+                try:
+                    query = f'SELECT DISTINCT "{col_name}" FROM "{table_name}" WHERE "{col_name}" IS NOT NULL LIMIT 25'
+                    result_df, error = sqlite_store.execute_query(query, user_id)
+
+                    if (
+                        result_df is not None
+                        and len(result_df) > 0
+                        and len(result_df) <= 20
+                    ):
+                        values = [
+                            str(v)
+                            for v in result_df[col_name].tolist()
+                            if v is not None
+                        ]
+                        if values:
+                            context["categorical_columns"][col_name] = {
+                                "values": values,
+                                "count": len(values),
+                            }
+                except Exception as e:
+                    print(f"Warning: Could not get distinct values for {col_name}: {e}")
+
+            # Classify other columns
+            elif col_type in ["INTEGER", "REAL", "NUMERIC", "FLOAT", "DOUBLE"]:
+                context["numeric_columns"].append(col_name)
+            else:
+                context["text_columns"].append(col_name)
+
+        return context
+
+    def _get_date_semantic(self, col_name: str) -> str:
+        """Get semantic meaning of a date column"""
+        col_lower = col_name.lower()
+
+        for keyword, semantic in self.DATE_SEMANTICS.items():
+            if keyword in col_lower:
+                return semantic
+
+        return "date/time field"
+
+    def format_context_for_prompt(self, context: dict) -> str:
+        """Format column context for LLM prompt"""
+        parts = []
+
+        # Date columns with semantics
+        if context.get("date_columns"):
+            parts.append("\n**DATE COLUMNS (choose based on user intent):**")
+            for col_name, info in context["date_columns"].items():
+                parts.append(f"  - {col_name}: {info['semantic']}")
+
+        # Categorical columns with values
+        if context.get("categorical_columns"):
+            parts.append(
+                "\n**CATEGORICAL COLUMNS (use these EXACT values in WHERE clauses):**"
+            )
+            for col_name, info in context["categorical_columns"].items():
+                values = info["values"]
+                if len(values) <= 10:
+                    values_str = ", ".join([f"'{v}'" for v in values])
+                else:
+                    values_str = ", ".join([f"'{v}'" for v in values[:10]])
+                    values_str += f" ... (+{len(values) - 10} more)"
+                parts.append(f"  - {col_name}: [{values_str}]")
+
+        return "\n".join(parts)
+
+
+# Create singleton instance
+column_analyzer = ColumnAnalyzer()
+
+
 class QueryService:
     """Main service for handling user queries"""
 
@@ -108,7 +234,7 @@ class QueryService:
         relevant_tables = query_excel_schemas(
             query_embedding=question_embedding,
             user_id=user_id,
-            top_k=min(top_k, 3),  # Usually 2-3 tables are enough
+            top_k=min(top_k, 3),
         )
 
         if not relevant_tables:
@@ -127,14 +253,53 @@ class QueryService:
             if sample_df is not None:
                 sample_data[table["table_name"]] = sample_df.to_string(index=False)
 
-        # Step 3: Generate SQL
+        # Step 3: Get rich column context (distinct values, semantics)
+        # FIXED: Proper initialization
+        column_context = {
+            "categorical_columns": {},
+            "date_columns": {},
+            "numeric_columns": [],
+            "text_columns": [],
+        }
+
+        for table in relevant_tables[:2]:
+            table_name = table["table_name"]
+            columns = table.get("columns", [])
+
+            try:
+                ctx = column_analyzer.get_column_context(
+                    table_name=table_name, columns=columns, user_id=user_id
+                )
+
+                # Merge contexts properly
+                if ctx.get("categorical_columns"):
+                    column_context["categorical_columns"].update(
+                        ctx["categorical_columns"]
+                    )
+
+                if ctx.get("date_columns"):
+                    column_context["date_columns"].update(ctx["date_columns"])
+
+                if ctx.get("numeric_columns"):
+                    column_context["numeric_columns"].extend(ctx["numeric_columns"])
+
+                if ctx.get("text_columns"):
+                    column_context["text_columns"].extend(ctx["text_columns"])
+
+            except Exception as e:
+                print(f"Warning: Could not get column context for {table_name}: {e}")
+
+        # Step 4: Generate SQL with enhanced context
         sql, explanation = sql_generator.generate_sql(
             question=question,
             schemas=relevant_tables,
             sample_data=sample_data,
+            column_context=column_context,
             conversation_history=history,
             temperature=temperature,
         )
+
+        print(f"Generated SQL: {sql}")
 
         if not sql:
             return {
@@ -145,9 +310,12 @@ class QueryService:
                 "error": explanation,
             }
 
-        # Step 4: Execute with retry
+        # Step 5: Execute with retry
         result_df, final_sql, error = self._execute_with_retry(
-            sql=sql, user_id=user_id, schemas=relevant_tables
+            sql=sql,
+            user_id=user_id,
+            schemas=relevant_tables,
+            column_context=column_context,
         )
 
         if error:
@@ -162,7 +330,7 @@ class QueryService:
                 "error": error,
             }
 
-        # Step 5: Generate natural language response
+        # Step 6: Generate natural language response
         answer = response_generator.generate_response(
             question=question,
             data=result_df,
@@ -176,7 +344,7 @@ class QueryService:
         if result_df is not None and len(result_df) > 0:
             data_result = {
                 "columns": list(result_df.columns),
-                "rows": result_df.head(100).to_dict("records"),  # Limit rows
+                "rows": result_df.head(100).to_dict("records"),
                 "row_count": len(result_df),
             }
 
@@ -197,12 +365,26 @@ class QueryService:
         }
 
     def _execute_with_retry(
-        self, sql: str, user_id: str, schemas: List[Dict]
+        self,
+        sql: str,
+        user_id: str,
+        schemas: List[Dict],
+        column_context: Dict[str, Any] = None,
     ) -> Tuple[Optional[pd.DataFrame], str, Optional[str]]:
         """Execute SQL with automatic retry on failure"""
 
         current_sql = sql
         schema_context = "\n\n".join([s.get("prompt_text", str(s)) for s in schemas])
+
+        # Format column context for retry
+        column_context_str = ""
+        if column_context:
+            try:
+                column_context_str = column_analyzer.format_context_for_prompt(
+                    column_context
+                )
+            except Exception as e:
+                print(f"Warning: Could not format column context: {e}")
 
         for attempt in range(self.MAX_RETRIES):
             # Execute query
@@ -218,6 +400,7 @@ class QueryService:
                     original_sql=current_sql,
                     error_message=error,
                     schema_context=schema_context,
+                    column_context=column_context_str,
                 )
 
                 if fixed_sql and fixed_sql != current_sql:

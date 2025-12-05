@@ -167,3 +167,39 @@ async def clear_session(
         return {"message": f"Session {session_id} cleared"}
 
     return {"message": "No session specified"}
+
+
+# Add to vector_routes.py
+
+
+@router.get("/tables/{table_name}/columns")
+async def get_table_column_info(
+    table_name: str,
+    current_user: Users = Depends(get_current_user),
+):
+    """Get detailed column information including distinct values for categorical columns"""
+    from app.vector_store.sqlite_store import sqlite_store
+    from app.utils.column_analyzer import column_analyzer
+
+    # Verify table belongs to user
+    user_tables = sqlite_store.get_user_tables(str(current_user.id))
+    table_info = None
+    for t in user_tables:
+        if t["table_name"] == table_name:
+            table_info = t
+            break
+
+    if not table_info:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Table not found or access denied",
+        )
+
+    # Get column context
+    context = column_analyzer.get_column_context(
+        table_name=table_name,
+        columns=table_info.get("columns", []),
+        user_id=str(current_user.id),
+    )
+
+    return {"table_name": table_name, "column_context": context}
