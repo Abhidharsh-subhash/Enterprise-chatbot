@@ -70,7 +70,7 @@ def add_excel_schema(
     prompt_text = _create_schema_prompt(schema_info)
 
     col.upsert(
-        ids=[schema_info["table_name"]],
+        ids=f"{schema_info['user_id']}::{schema_info['doc_id']}::{schema_info['table_name']}",
         documents=[schema_text],  # Text used for embedding
         embeddings=[embedding],
         metadatas=[

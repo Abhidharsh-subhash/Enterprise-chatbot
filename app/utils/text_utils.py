@@ -92,19 +92,22 @@ def split_text_into_chunks(
 
 
 def create_schema_embedding_text(schema_info: Dict[str, Any]) -> str:
-    """
-    Create text representation of schema for embedding.
-    This is what gets embedded in ChromaDB for semantic search.
-    """
     parts = [
         f"Excel spreadsheet from file {schema_info['original_filename']}",
         f"sheet named {schema_info['sheet_name']}",
         f"containing {schema_info['row_count']} rows of data.",
+        f"The data is stored in SQLite table {schema_info['table_name']}.",
         "The table has the following columns:",
     ]
 
     for col in schema_info["columns"]:
-        col_text = f"{col['name']} storing {col['type'].lower()} values"
+        logical = col.get("logical_type", "").lower()
+        col_type_desc = logical or col["type"].lower()
+
+        col_text = (
+            f"{col['name']} (original header '{col['original_name']}') "
+            f"storing {col_type_desc} values"
+        )
 
         if col.get("samples"):
             samples = [str(s) for s in col["samples"][:3]]
@@ -112,6 +115,9 @@ def create_schema_embedding_text(schema_info: Dict[str, Any]) -> str:
 
         if col.get("stats") and col["stats"].get("min") is not None:
             col_text += f" ranging from {col['stats']['min']} to {col['stats']['max']}"
+
+        if col.get("logical_type") == "date":
+            col_text += " in YYYY-MM-DD format"
 
         parts.append(col_text)
 

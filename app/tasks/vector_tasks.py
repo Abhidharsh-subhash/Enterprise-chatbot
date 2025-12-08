@@ -65,7 +65,12 @@ def process_file_task(file_path: str, user_id: str):
 
     finally:
         db.close()
-        print("🔒 DB connection closed")
+        # Try to clean up the temp file
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as cleanup_err:
+            print(f"⚠️ Failed to delete temp file {file_path}: {cleanup_err}")
 
 
 def _process_excel_file(file_path: str, user_id: str, doc_id: str, file_name: str):

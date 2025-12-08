@@ -5,8 +5,142 @@ from pathlib import Path
 import json
 import re
 from datetime import datetime, timezone
-
 from app.core.config import settings
+
+import math
+
+EXCEL_ERROR_VALUES = {"#N/A", "#DIV/0!", "#REF!", "#NAME?", "#NULL!", "#VALUE!"}
+
+
+def _try_parse_int(x):
+    try:
+        return int(str(x))
+    except Exception:
+        return None
+
+
+def _try_parse_float(x):
+    try:
+        return float(str(x))
+    except Exception:
+        return None
+
+
+def _try_parse_date(x):
+    """
+    Try a few common date formats; extend if you need more.
+    Return a datetime or None.
+    """
+    if pd.isna(x):
+        return None
+
+    s = str(x).strip()
+    if not s:
+        return None
+
+    fmts = [
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _infer_logical_type(series: pd.Series, sample_size: int = 200) -> Dict[str, str]:
+    """
+    Infer high-level (logical) type + SQLite type for a column.
+    Returns e.g. {"logical_type": "number", "sqlite_type": "REAL"}.
+    """
+    non_null = series.dropna()
+    if non_null.empty:
+        return {"logical_type": "string", "sqlite_type": "TEXT"}
+
+    sample = non_null.sample(min(sample_size, len(non_null)), random_state=0)
+
+    int_count = 0
+    float_count = 0
+    date_count = 0
+    boolish_count = 0
+    total = len(sample)
+
+    for v in sample:
+        s = str(v).strip().lower()
+        if s in ("true", "false", "yes", "no", "y", "n", "0", "1"):
+            boolish_count += 1
+
+        if _try_parse_int(v) is not None:
+            int_count += 1
+        elif _try_parse_float(v) is not None:
+            float_count += 1
+
+        if _try_parse_date(v) is not None:
+            date_count += 1
+
+    if total == 0:
+        return {"logical_type": "string", "sqlite_type": "TEXT"}
+
+    # Heuristics
+    if date_count / total > 0.8:
+        return {"logical_type": "date", "sqlite_type": "TEXT"}
+
+    if boolish_count / total > 0.8:
+        return {"logical_type": "boolean", "sqlite_type": "INTEGER"}
+
+    if (int_count + float_count) / total > 0.8:
+        if float_count > 0:
+            return {"logical_type": "number", "sqlite_type": "REAL"}
+        else:
+            return {"logical_type": "number", "sqlite_type": "INTEGER"}
+
+    return {"logical_type": "string", "sqlite_type": "TEXT"}
+
+
+def _clean_cell_value(value: Any, logical_type: str) -> Any:
+    """
+    Normalize a single cell value based on logical type.
+    """
+    if pd.isna(value):
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    if s in EXCEL_ERROR_VALUES:
+        return None
+
+    if logical_type == "number":
+        i = _try_parse_int(s)
+        if i is not None:
+            return i
+        f = _try_parse_float(s)
+        if f is not None and not math.isnan(f):
+            return f
+        return None
+
+    if logical_type == "date":
+        dt = _try_parse_date(s)
+        if dt is not None:
+            # store ISO date string
+            return dt.strftime("%Y-%m-%d")
+        return None
+
+    if logical_type == "boolean":
+        if s in ("true", "yes", "y", "1"):
+            return 1
+        if s in ("false", "no", "n", "0"):
+            return 0
+        return None
+
+    # default: text
+    return s
 
 
 class SQLiteStore:
@@ -63,13 +197,15 @@ class SQLiteStore:
                 continue
 
             # Clean column names for SQL
-            df.columns = self._clean_column_names(df.columns)
+            # df.columns = self._clean_column_names(df.columns)
+            clean_names, mapping = self._clean_column_names(df.columns)
+            df.columns = clean_names
 
             # Generate unique table name (include user_id to avoid conflicts)
             table_name = self._generate_table_name(file_path.stem, sheet_name, user_id)
 
             # Extract column info BEFORE storing
-            columns_info = self._extract_columns_info(df)
+            columns_info = self._extract_columns_info(df, mapping)
 
             # Store data in SQLite
             with self._get_connection() as conn:
@@ -115,10 +251,11 @@ class SQLiteStore:
 
         return created_tables
 
-    def _clean_column_names(self, columns) -> List[str]:
-        """Make column names SQL-friendly"""
+    def _clean_column_names(self, columns) -> Tuple[List[str], Dict[str, str]]:
+        """Make column names SQL-friendly and return mapping original->clean"""
         clean_names = []
         seen = set()
+        mapping = {}
 
         for col in columns:
             clean = str(col).strip().lower()
@@ -130,7 +267,6 @@ class SQLiteStore:
             if clean[0].isdigit():
                 clean = "col_" + clean
 
-            # Handle duplicates
             original = clean
             counter = 1
             while clean in seen:
@@ -139,8 +275,9 @@ class SQLiteStore:
 
             seen.add(clean)
             clean_names.append(clean)
+            mapping[str(col)] = clean
 
-        return clean_names
+        return clean_names, mapping
 
     def _generate_table_name(self, filename: str, sheet_name: str, user_id: str) -> str:
         """Generate unique table name"""
@@ -155,14 +292,17 @@ class SQLiteStore:
 
         return table_name[:60]
 
-    def _extract_columns_info(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """Extract detailed column information for schema"""
+    def _extract_columns_info(
+        self, df: pd.DataFrame, mapping: Dict[str, str]
+    ) -> List[Dict[str, Any]]:
+        # build reverse mapping: cleaned -> original
+        reverse_mapping = {clean: orig for orig, clean in mapping.items()}
         columns_info = []
 
         for col in df.columns:
             col_data = df[col]
 
-            # Determine type
+            # SQL / physical type
             if pd.api.types.is_integer_dtype(col_data):
                 col_type = "INTEGER"
             elif pd.api.types.is_float_dtype(col_data):
@@ -174,11 +314,9 @@ class SQLiteStore:
             else:
                 col_type = "TEXT"
 
-            # Get sample values (only 5, not all data!)
             samples = col_data.dropna().unique()[:5].tolist()
-            samples = [str(s)[:50] for s in samples]  # Limit length too
+            samples = [str(s)[:50] for s in samples]
 
-            # Basic stats for numeric columns
             stats = {}
             if pd.api.types.is_numeric_dtype(col_data) and not col_data.isna().all():
                 stats = {
@@ -189,11 +327,13 @@ class SQLiteStore:
             columns_info.append(
                 {
                     "name": col,
+                    "original_name": reverse_mapping.get(col, col),
                     "type": col_type,
                     "samples": samples,
                     "null_count": int(col_data.isna().sum()),
                     "unique_count": int(col_data.nunique()),
                     "stats": stats,
+                    # "logical_type": ...,  # you can add this later using _infer_logical_type
                 }
             )
 

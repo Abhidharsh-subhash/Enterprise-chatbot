@@ -120,7 +120,13 @@ class QueryService:
                 "error": "No matching tables",
             }
 
-        # Step 2: Get sample data for context
+        # Step 2: Get detailed schema prompts from SQLite (more reliable than stored text)
+        for t in relevant_tables:
+            schema_prompt = sqlite_store.get_table_schema_for_prompt(t["table_name"])
+            if schema_prompt:
+                t["prompt_text"] = schema_prompt
+
+        # Step 3: Get sample data for context
         sample_data = {}
         for table in relevant_tables[:2]:
             sample_df = sqlite_store.get_sample_data(table["table_name"], 3)

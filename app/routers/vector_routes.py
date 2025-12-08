@@ -11,10 +11,11 @@ from app.tasks.vector_tasks import process_file_task
 from app.models.users import Users
 from app.dependencies import get_current_user
 from app.core.logger import logger
-import uuid
-from typing import Dict, Any, Optional
+import uuid, shutil
+from typing import Optional
 from app.schemas.vector import AskRequest, AskResponse, DataResult
 from app.services.query_service import query_service
+from pathlib import Path
 
 router = APIRouter(prefix="/vector", tags=["convertion"])
 
@@ -24,15 +25,18 @@ async def upload_file(
     file: UploadFile = File(...), current_user: Users = Depends(get_current_user)
 ):
     try:
-        upload_dir = "uploads"
-        os.makedirs(upload_dir, exist_ok=True)
-        file_path = os.path.join(upload_dir, file.filename)
+        upload_dir = Path("uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
+        ext = Path(file.filename).suffix
+        disk_name = f"{uuid.uuid4().hex}{ext}"
+        file_path = upload_dir / disk_name
+
+        with file_path.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
 
         # Send Celery task to background
-        process_file_task.delay(file_path, current_user.id)
+        process_file_task.delay(str(file_path), current_user.id)
 
         return {
             "status": status.HTTP_201_CREATED,
