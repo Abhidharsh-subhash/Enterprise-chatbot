@@ -109,6 +109,18 @@ COMMON PATTERNS:
 
 User Question: {question}
 
+**IMPORTANT SQL GENERATION RULES:**
+1. Column names MUST be in lowercase (e.g., use `product_name` not `Product_Name`)
+2. All string values in WHERE, LIKE, IN clauses MUST be in lowercase (e.g., use 'electronics' not 'Electronics')
+3. Use LOWER() function is NOT needed - data is already stored in lowercase
+4. For text comparisons, always use lowercase values
+
+Examples:
+- Correct: SELECT * FROM table WHERE category = 'electronics'
+- Wrong:   SELECT * FROM table WHERE category = 'Electronics'
+- Correct: SELECT * FROM table WHERE product_name LIKE '%iphone%'
+- Wrong:   SELECT * FROM table WHERE product_name LIKE '%iPhone%'
+
 Generate a SQLite query to answer this question. Return ONLY the SQL query.
 """
 

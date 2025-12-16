@@ -178,6 +178,22 @@ class SQLiteStore:
             )
             conn.commit()
 
+    def _convert_values_to_lowercase(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert all string/text column values to lowercase.
+        Only affects string columns, leaves numeric/date columns unchanged.
+        """
+        df = df.copy()
+
+        for col in df.columns:
+            # Check if column contains string/object data
+            if df[col].dtype == "object":
+                df[col] = df[col].apply(
+                    lambda x: x.lower().strip() if isinstance(x, str) else x
+                )
+
+        return df
+
     def import_excel(
         self, file_path: str, user_id: str, doc_id: str
     ) -> List[Dict[str, Any]]:
@@ -196,10 +212,16 @@ class SQLiteStore:
             if df.empty:
                 continue
 
-            # Clean column names for SQL
-            # df.columns = self._clean_column_names(df.columns)
+            # ════════════════════════════════════════════════════════
+            # STEP 1: Clean column names (already converts to lowercase)
+            # ════════════════════════════════════════════════════════
             clean_names, mapping = self._clean_column_names(df.columns)
             df.columns = clean_names
+
+            # ════════════════════════════════════════════════════════
+            # STEP 2: Convert all string VALUES to lowercase  ← NEW!
+            # ════════════════════════════════════════════════════════
+            df = self._convert_values_to_lowercase(df)
 
             # Generate unique table name (include user_id to avoid conflicts)
             table_name = self._generate_table_name(file_path.stem, sheet_name, user_id)
@@ -220,7 +242,7 @@ class SQLiteStore:
                     """
                     INSERT OR REPLACE INTO _excel_tables_metadata 
                     (table_name, original_filename, sheet_name, columns_info, 
-                     row_count, user_id, doc_id, file_path)
+                    row_count, user_id, doc_id, file_path)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (

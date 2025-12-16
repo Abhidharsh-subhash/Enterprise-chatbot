@@ -131,9 +131,16 @@ But the query failed with error: {error}
 
 {f"Attempted SQL: {attempted_sql}" if attempted_sql else ""}
 
+═══════════════════════════════════════════════════════════════
+IMPORTANT DATABASE RULES TO REMEMBER:
+═══════════════════════════════════════════════════════════════
+1. ALL column names in the database are in lowercase (e.g., `product_name`, not `Product_Name`)
+2. ALL string/text values in the database are stored in lowercase (e.g., 'electronics', not 'Electronics')
+3. When suggesting corrections, always use lowercase for column names and values
+
 Generate a helpful, friendly response that:
 1. Acknowledges the question couldn't be answered
-3. Suggests what the user might try instead
+2. Suggests what the user might try instead (using lowercase column names and values)
 
 Keep it brief and helpful.
 """
