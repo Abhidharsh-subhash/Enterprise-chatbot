@@ -71,7 +71,7 @@ COMMON PATTERNS:
 
     def __init__(self):
         self.client = OpenAI(api_key=settings.openai_api_key)
-        self.model = getattr(settings, "llm_model", "gpt-4o-mini")
+        self.model = getattr(settings, "llm_model", "gpt-4o")
 
     def generate_sql(
         self,

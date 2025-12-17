@@ -332,7 +332,7 @@ Please answer based on the context provided."""
 
         try:
             response = client.chat.completions.create(
-                model=getattr(settings, "llm_model", "gpt-4o-mini"),
+                model=getattr(settings, "llm_model", "gpt-4o"),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
